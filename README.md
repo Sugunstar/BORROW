@@ -1,4 +1,4 @@
-# BORROW - Brain On Remote, Run On Workstation
+# borrow: a free, self-hosted Qwen coding assistant for your terminal
 
 Chat with a strong open coding model (**Qwen3-Coder-30B-A3B**) from your own terminal, in the style of Claude Code:
 type `/` to open a command menu, `@file` to attach files, or plain text to chat. The model runs for free on
@@ -9,7 +9,7 @@ No GPU of your own and no paid services needed.
 ```
  Your computer                          Internet                    Kaggle notebook (2x T4 GPUs)
 ┌────────────────────┐   HTTPS + API key   ┌────────────────┐   ┌───────────────────────────────┐
-│ qwen_cli.py        │ ──────────────────► │ Cloudflare     │──►│ llama-server (llama.cpp, CUDA) │
+│ borrow             │ ──────────────────► │ Cloudflare     │──►│ llama-server (llama.cpp, CUDA) │
 │ (this CLI)         │ ◄────────────────── │ quick tunnel   │◄──│ Qwen3-Coder-30B-A3B  (Q4_K_M)  │
 └────────────────────┘     streamed tokens └────────────────┘   └───────────────────────────────┘
 ```
@@ -36,7 +36,7 @@ No GPU of your own and no paid services needed.
 | File | Runs on | Purpose |
 |---|---|---|
 | `serve_qwen_kaggle.py` | Kaggle notebook | Builds llama.cpp with CUDA, downloads the model, starts the server, opens the tunnel and prints your connection details |
-| `qwen_cli.py` | Your computer | The terminal you use: `/` command menu, `@file` attachments, streaming replies and chat memory |
+| `borrow.py` + `pyproject.toml` | Your computer | The `borrow` command: `/` command menu, `@file` attachments, streaming replies and chat memory |
 
 Observed in one real run on 2x Tesla T4: about **58-68 tokens/second** with the 30B coder model
 (only about 3B parameters are active per token, which is why it is fast).
@@ -51,9 +51,8 @@ Observed in one real run on 2x Tesla T4: about **58-68 tokens/second** with the 
 
 **Your computer**
 - Python 3.8 or newer. Nothing else is required.
-- `qwen_cli.py` installs `prompt_toolkit` automatically on first run (this powers the `/` menu). If that
-  fails it falls back to a basic mode with Tab completion and no dropdown. You can install it yourself with
-  `pip install prompt_toolkit`.
+- `prompt_toolkit` powers the `/` menu. Installing `borrow` (below) pulls it in for you. If it is missing, the CLI
+  tries to install it on first run, and otherwise falls back to a basic mode with Tab completion and no dropdown.
 - Optional: `git` (for `/commit`).
 
 ## Quick start
@@ -72,10 +71,30 @@ Observed in one real run on 2x Tesla T4: about **58-68 tokens/second** with the 
 
 5. **Leave the cell running.** It holds the server open. Stopping the cell shuts everything down.
 
-### 2. Open the CLI on your computer
+### 2. Install `borrow` on your computer (once)
+
+Put `borrow.py`, `pyproject.toml` and this README in one folder, open a terminal there, and run **one** of:
 
 ```bash
-python qwen_cli.py
+pipx install .        # recommended: isolated, and puts `borrow` on your PATH
+pip install .         # also works
+pip install -e .      # editable: changes to borrow.py take effect immediately
+```
+
+Check it worked:
+
+```bash
+borrow --version
+```
+
+If your shell says `borrow: command not found` after `pip install`, the folder that pip puts commands in is not on
+your PATH. Use `pipx install .` (then run `pipx ensurepath` and open a new terminal), or add pip's scripts folder to
+your PATH. You can always run it without installing: `python borrow.py`.
+
+### 3. Connect and chat
+
+```bash
+borrow
 ```
 
 Paste the `/connect ...` line from the Kaggle output:
@@ -90,14 +109,10 @@ The CLI saves the endpoint, checks the server and prints `saved. server reachabl
 /code a python function that merges two sorted lists
 ```
 
-### 3. Next time
+### 4. Next time
 
 Kaggle clears everything between sessions, so each new session gives a **new URL and key**. Run the Kaggle cell
 again (the build and download repeat), then run `/connect` with the new values.
-
-> Tip: to avoid typing `python qwen_cli.py`, add an alias, for example in `~/.bashrc` or `~/.zshrc`:
-> `alias qwen='python3 ~/path/to/qwen_cli.py'`. On Windows PowerShell, add
-> `function qwen { python C:\path\to\qwen_cli.py $args }` to your profile.
 
 ## Using the CLI
 
@@ -108,7 +123,7 @@ again (the build and download repeat), then run `/connect` with the new values.
 - Type **plain text** to chat.
 - **Ctrl+C** stops a reply while it is being generated. **Ctrl+D** or `/exit` quits.
 - `/help` lists every command with its flags and what it does. `/help review` shows one command with an example.
-- `python qwen_cli.py --help` prints the same help from your normal shell.
+- `borrow --help` prints the same help from your normal shell, and `borrow --version` prints the version.
 
 ## Talking to the model
 
@@ -201,13 +216,14 @@ why is @app.py slow?
 Run a single command from your normal shell without opening the interactive prompt:
 
 ```bash
-python qwen_cli.py /review @app.py
-git diff | python qwen_cli.py /review -      # a lone "-" means: read piped input
+borrow /review @app.py
+git diff | borrow /review -      # a lone "-" means: read piped input
 ```
 
 ## Settings and saved data
 
-- `/connect <url> <key>` saves the endpoint to `~/.qwen_cli.json`. Prompt history is kept in `~/.qwen_cli_history`.
+- `/connect <url> <key>` saves the endpoint to `~/.borrow.json`. Prompt history is kept in `~/.borrow_history`. (Older
+  versions saved to `~/.qwen_cli.json`; `borrow` still reads that file if the new one does not exist.)
 - The environment variables `ASK_URL` and `ASK_KEY` override the saved values:
 
   ```bash
@@ -251,7 +267,7 @@ you add a preset with the repo name and quantization. The model is exposed under
 ## Security and privacy
 
 - **Anyone with the URL and the key can use your GPU session.** Treat the key like a password. Do not post
-  screenshots or logs that contain it. `~/.qwen_cli.json` stores it in plain text (permissions are restricted where
+  screenshots or logs that contain it. `~/.borrow.json` stores it in plain text (permissions are restricted where
   the OS supports it); do not commit it to git.
 - The key is random per session and the server rejects requests without it. The tunnel URL alone is not enough.
 - **Your prompts and attached files travel through Cloudflare to a Kaggle machine.** Before sending proprietary
@@ -275,8 +291,8 @@ you add a preset with the repo name and quantization. The model is exposed under
 | `HTTP 401` | Wrong or old key. Use the key from the current session's output |
 | `HTTP 530` / `1033`, or `/status` says NOT reachable | The session ended or the tunnel dropped. Re-run the Kaggle cell and `/connect` with the new URL and key |
 | `Request failed (is the Kaggle session still running?)` | Same as above; check the Kaggle tab |
-| No `/` dropdown | `pip install prompt_toolkit`, then restart `qwen_cli.py`. Use a real terminal (some IDE consoles do not support it) |
-| `python qwen_cli.py /review -` hangs | The lone `-` waits for piped input. Pipe something in (`git diff \| python qwen_cli.py /review -`) or remove the `-` |
+| No `/` dropdown | `pip install prompt_toolkit`, then restart `borrow`. Use a real terminal (some IDE consoles do not support it) |
+| `borrow /review -` hangs | The lone `-` waits for piped input. Pipe something in (`git diff \| borrow /review -`) or remove the `-` |
 
 ## Files and log locations
 
@@ -290,11 +306,11 @@ On Kaggle (the script chooses the location with the most free disk, usually `/tm
 | `/tmp/qwen_server/tunnel.log` | Cloudflare tunnel log |
 | `/tmp/qwen_server/cmake_configure.log`, `cmake_build.log` | Build logs |
 
-On your computer: `~/.qwen_cli.json` (saved URL and key) and `~/.qwen_cli_history` (prompt history).
+On your computer: `~/.borrow.json` (saved URL and key) and `~/.borrow_history` (prompt history).
 
 ## Status
 
 Verified on a real Kaggle session (2x T4): build, model download, server start, tunnel, and a request through the
-tunnel from a separate machine. `qwen_cli.py` was verified with automated tests against a mock server (command
+tunnel from a separate machine. `borrow` was verified, including installing it into a clean virtual environment with `pip`, with automated tests against a mock server (command
 parsing, menu completions, streaming, file attachments, error handling); its behaviour in a real terminal, and on
 Windows, has had less testing. If something misbehaves, open an issue with your OS, terminal and the exact error.
