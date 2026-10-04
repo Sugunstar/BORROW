@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""qwen_cli - a Claude-Code-style terminal for your self-hosted Qwen coder endpoint.
+"""borrow - a Claude-Code-style terminal for your self-hosted Qwen coder endpoint.
 
-Start it:      python qwen_cli.py
-One-shot:      python qwen_cli.py /review @app.py       (pipe input in with a lone "-": git diff | python qwen_cli.py /review -)
+Start it:      borrow
+One-shot:      borrow /review @app.py       (pipe input in with a lone "-": git diff | borrow /review -)
 Connect:       set ASK_URL / ASK_KEY (printed by the Kaggle script) or type  /connect <url> <key>
 
 Inside the CLI type  /  to open the command menu, @ to attach files, plain text to chat.
-Nothing else to type: no "python ask.py" prefix, no flags to remember. Type /help for everything.
+No flags to remember: type /help for every command, its flags and what it does.
 """
 import difflib, json, os, re, shlex, subprocess, sys, urllib.error, urllib.request
 from pathlib import Path
 
-CONFIG_PATH = Path.home() / ".qwen_cli.json"
-HISTORY_PATH = Path.home() / ".qwen_cli_history"
+__version__ = "0.1.0"
+CONFIG_PATH = Path.home() / ".borrow.json"
+LEGACY_CONFIG_PATH = Path.home() / ".qwen_cli.json"   # older versions saved here
+HISTORY_PATH = Path.home() / ".borrow_history"
 UA = {"User-Agent": "curl/8.5.0"}
 MAX_FILE_CHARS = 60_000
 MAX_HISTORY_CHARS = 70_000      # keeps the conversation inside the 32K-token context window
@@ -90,10 +92,12 @@ class UserError(Exception):
 # ----------------------------------------------------------------------------- config
 def load_config():
     cfg = {}
-    try:
-        cfg = json.loads(CONFIG_PATH.read_text())
-    except Exception:
-        pass
+    for path in (CONFIG_PATH, LEGACY_CONFIG_PATH):
+        try:
+            cfg = json.loads(path.read_text())
+            break
+        except Exception:
+            continue
     STATE["url"] = (os.environ.get("ASK_URL") or cfg.get("url", "")).rstrip("/")
     STATE["key"] = os.environ.get("ASK_KEY") or cfg.get("key", "")
 
@@ -269,8 +273,8 @@ def print_help(only=None):
         print("  @path        attach a file to any command or chat message (Tab completes paths)")
         print("  plain text   chat with memory; follow-ups can refer to earlier answers or reviews")
         print("  Ctrl+C       stop a reply while it is generating   |   Ctrl+D or /exit  quit")
-        print("  One-shot from your shell:  python qwen_cli.py /review @app.py")
-        print("  Pipe input in with a lone -:  git diff | python qwen_cli.py /review -\n")
+        print("  One-shot from your shell:  borrow /review @app.py")
+        print("  Pipe input in with a lone -:  git diff | borrow /review -\n")
 
 
 def cmd_help(rest):
@@ -473,7 +477,7 @@ def basic_prompt():
 
 def repl(session=None):
     prompt = (lambda: session.prompt("> ")) if session else basic_prompt()
-    print(bold("Qwen coder CLI") + dim("   type / for commands, @ to attach files, /help for details"))
+    print(bold("borrow") + dim("  Qwen coder CLI   type / for commands, @ to attach files, /help for details"))
     if not STATE["url"]:
         print(red("Not connected yet. Type /connect <url> <key>  (or set ASK_URL and ASK_KEY)."))
     elif not health():
@@ -493,6 +497,9 @@ def repl(session=None):
 
 def main():
     args = sys.argv[1:]
+    if args and args[0] in ("-V", "--version"):
+        print(f"borrow {__version__}")
+        return
     if args and args[0] in ("-h", "--help", "help"):
         print(__doc__)
         print_help()
