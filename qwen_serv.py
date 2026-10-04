@@ -7,8 +7,8 @@ HOW TO USE
        - Accelerator: GPU T4 x2   (needed for the 30B coder model; one GPU runs the small model)
        - Internet: On             (needs a phone-verified Kaggle account)
   2. Paste this ENTIRE file into ONE code cell and run it.
-  3. First run takes ~15-25 min (build + ~19 GB download). When ready it prints an `ask.py`
-     script. Save it on your own computer and use it from your terminal.
+  3. First run takes ~15-25 min (build + ~19 GB download). When ready it prints the URL and
+     key. Use them on your own computer (for example with `/connect <url> <key>` in `borrow`).
   4. The cell keeps running on purpose (it holds the server open). Stop the cell to shut down.
 
 Every step stops with a clear error and a log tail if it fails.
@@ -287,149 +287,10 @@ def selftest_tunnel(url):
         except Exception as e:
             print("  DNS lookup failed:", e)
         print("Self-test from inside Kaggle did not pass. This check is optional: the server is still "
-              "running. Test from your own computer with ask.py (printed below).")
+              "running. Test from your own computer using the URL and key printed below.")
         return False
     finally:
         u3c.allowed_gai_family = original
-
-
-ASK_TEMPLATE = r'''#!/usr/bin/env python3
-"""ask.py - talk to your Qwen coder endpoint from the terminal.
-
-  ask.py "question"                          plain answer (streams as it is generated)
-  ask.py --code "fizzbuzz in python" > f.py  only the code block
-  cat app.py | ask.py --review               review a file
-  cat app.py | ask.py --test --code > test_app.py
-  python x.py 2>&1 | ask.py --fix            paste an error and get a fix
-  git diff | ask.py --commit                 commit message from a diff
-  ask.py --shell "find files over 100MB"     one shell command (READ it before running!)
-  ask.py -f a.py -f b.py "why does a call b wrong?"
-  ask.py --chat                              interactive chat with memory (/clear, /exit)
-Set ASK_URL / ASK_KEY in your environment to point at a new session without editing this file.
-"""
-import argparse, json, os, re, sys, urllib.request, urllib.error
-
-URL = os.environ.get("ASK_URL", "__URL__").rstrip("/")
-KEY = os.environ.get("ASK_KEY", "__KEY__")
-
-BASE = "You are a precise senior software engineer. Be concise and correct."
-MODES = {
-    "code":    "Reply with ONLY the code in a single fenced code block. No explanation.",
-    "explain": "Explain what the given code or error does in plain language, concisely, with bullet points.",
-    "review":  "Review the given code like a strict senior reviewer. List concrete bugs, risks and improvements, most important first.",
-    "test":    "Write thorough unit tests for the given code (pytest for Python unless told otherwise). Reply with only the test code in one fenced block.",
-    "fix":     "Find and fix the bug or error described. Reply with the corrected code in one fenced block, then 1-3 lines on the cause.",
-    "doc":     "Add clear docstrings and comments to the given code without changing behaviour. Reply with the full updated code in one fenced block.",
-    "commit":  "Write a concise conventional-commit message for the given diff: subject line under 72 chars, then optional bullets. Reply with only the message.",
-    "shell":   "Reply with ONLY a single bash command that does what is asked. No explanation, no code fence.",
-}
-
-ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-ap.add_argument("prompt", nargs="*", help="your instruction")
-for name in MODES:
-    if name != "code":
-        ap.add_argument("--" + name, dest="mode", action="store_const", const=name,
-                        help=MODES[name].split(". ")[0].rstrip("."))
-ap.add_argument("-c", "--code", action="store_true", help="output only the first code block")
-ap.add_argument("-f", "--file", action="append", default=[], help="include a file (repeatable)")
-ap.add_argument("-o", "--out", help="write the result to this file")
-ap.add_argument("-t", "--temp", type=float, default=0.2)
-ap.add_argument("-m", "--max-tokens", type=int, default=2048)
-ap.add_argument("--chat", action="store_true", help="interactive chat")
-ap.add_argument("-n", "--no-stdin", action="store_true", help="do not read piped input (use in scripts/IDEs)")
-a = ap.parse_args()
-
-mode = a.mode or ("code" if a.code else None)
-system = BASE + (" " + MODES[mode] if mode else "")
-
-
-def call(messages, stream):
-    body = json.dumps({"messages": messages, "max_tokens": a.max_tokens,
-                       "temperature": a.temp, "stream": stream}).encode()
-    req = urllib.request.Request(URL + "/v1/chat/completions", data=body, headers={
-        "Content-Type": "application/json", "Authorization": "Bearer " + KEY,
-        "User-Agent": "curl/8.5.0"})
-    try:
-        with urllib.request.urlopen(req, timeout=600) as r:
-            if not stream:
-                return json.load(r)["choices"][0]["message"]["content"]
-            text = ""
-            for raw in r:
-                line = raw.decode("utf-8", "replace").strip()
-                if not line.startswith("data:"):
-                    continue
-                payload = line[5:].strip()
-                if payload == "[DONE]":
-                    break
-                delta = json.loads(payload)["choices"][0].get("delta", {}).get("content") or ""
-                text += delta
-                print(delta, end="", flush=True)
-            return text
-    except urllib.error.HTTPError as e:
-        sys.exit("HTTP %s: %s" % (e.code, e.read().decode(errors="replace")[:500]))
-    except Exception as e:
-        sys.exit("Request failed (is the Kaggle session still running?): %s" % e)
-
-
-def first_block(text):
-    m = re.search(r"```[a-zA-Z0-9_+-]*\n(.*?)```", text, re.S)
-    return m.group(1) if m else text
-
-
-if a.chat:
-    messages = [{"role": "system", "content": system}]
-    print("Chat started. /clear resets, /exit quits.")
-    while True:
-        try:
-            q = input("you> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-        if q in ("/exit", "/quit"):
-            break
-        if q == "/clear":
-            messages = messages[:1]
-            print("(history cleared)")
-            continue
-        if not q:
-            continue
-        messages.append({"role": "user", "content": q})
-        print("qwen> ", end="", flush=True)
-        reply = call(messages, True)
-        print()
-        messages.append({"role": "assistant", "content": reply})
-        messages = messages[:1] + messages[1:][-12:]        # keep within the 32K context
-    sys.exit(0)
-
-parts = []
-if a.prompt:
-    parts.append(" ".join(a.prompt))
-for path in a.file:
-    try:
-        parts.append("File: %s\n```\n%s\n```" % (path, open(path, encoding="utf-8", errors="replace").read()))
-    except OSError as e:
-        sys.exit("Cannot read %s: %s" % (path, e))
-if not a.no_stdin and not sys.stdin.isatty():
-    piped = sys.stdin.read()
-    if piped.strip():
-        parts.append(("Input:\n" + piped) if parts else piped)
-if not parts:
-    ap.print_help()
-    sys.exit(1)
-
-messages = [{"role": "system", "content": system}, {"role": "user", "content": "\n\n".join(parts)}]
-extract = a.code or mode == "shell"
-text = call(messages, stream=not (extract or a.out))
-if extract:
-    text = first_block(text).strip("\n") if "```" in text else text.strip()
-if a.out:
-    open(a.out, "w", encoding="utf-8").write(text + "\n")
-    print("wrote " + a.out, file=sys.stderr)
-elif extract:
-    print(text)
-else:
-    print()
-'''
 
 
 def stop_tunnel():
@@ -497,21 +358,12 @@ def main():
     print("\n--- optional self-test through the tunnel (from inside Kaggle) ---")
     selftest_tunnel(public_url)
 
-    print("[6/6] Your terminal client")
-    client = ASK_TEMPLATE.replace("__URL__", public_url).replace("__KEY__", API_KEY)
-    open(f"{WORK}/ask.py", "w").write(client)
+    print("[6/6] Connection details")
     print("\n" + "=" * 70)
-    print("Save everything between the lines as ask.py on YOUR computer:")
+    print(f"URL: {public_url}")
+    print(f"KEY: {API_KEY}")
     print("=" * 70)
-    print(client)
-    print("=" * 70)
-    print('Then run, in your terminal:   python3 ask.py --code "write fizzbuzz in python" > fizz.py')
-    print("More modes: python3 ask.py --help")
-    print("\nNEXT SESSION: no need to re-save ask.py, just set these two variables to the new values:")
-    print(f"  Mac/Linux:   export ASK_URL={public_url} ASK_KEY={API_KEY}")
-    print(f"  PowerShell:  $env:ASK_URL='{public_url}'; $env:ASK_KEY='{API_KEY}'")
-    print(f"  Windows cmd: set ASK_URL={public_url}& set ASK_KEY={API_KEY}")
-    print("\nUsing qwen_cli.py (the / menu)? Start it and type:")
+    print("\nIn borrow, connect with:")
     print(f"  /connect {public_url} {API_KEY}")
     print("Keep this cell running. A new session means a new URL and key: run the cell again.")
 
