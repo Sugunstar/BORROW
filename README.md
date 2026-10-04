@@ -1,4 +1,4 @@
-# Qwen Coder CLI: a free, self-hosted coding assistant for your terminal
+# BORROW - Brain On Remote, Run On Workstation
 
 Chat with a strong open coding model (**Qwen3-Coder-30B-A3B**) from your own terminal, in the style of Claude Code:
 type `/` to open a command menu, `@file` to attach files, or plain text to chat. The model runs for free on
