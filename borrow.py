@@ -8,16 +8,21 @@ Connect:       set ASK_URL / ASK_KEY (printed by the Kaggle script) or type  /co
 Inside the CLI type  /  to open the command menu, @ to attach files, plain text to chat.
 No flags to remember: type /help for every command, its flags and what it does.
 """
-import difflib, json, os, re, shlex, subprocess, sys, urllib.error, urllib.request
+import difflib, json, os, re, shlex, shutil, subprocess, sys, urllib.error, urllib.request
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 CONFIG_PATH = Path.home() / ".borrow.json"
 LEGACY_CONFIG_PATH = Path.home() / ".qwen_cli.json"   # older versions saved here
 HISTORY_PATH = Path.home() / ".borrow_history"
 UA = {"User-Agent": "curl/8.5.0"}
 MAX_FILE_CHARS = 60_000
-MAX_HISTORY_CHARS = 70_000      # keeps the conversation inside the 32K-token context window
+DEFAULT_MAX_TOKENS = 8192   # a full response needs far more than 2048 tokens
+MAX_CONTINUES = 2           # auto-continue this many times if a reply hits the token limit
+CONTINUE_PROMPT = ("Your previous reply was cut off. Continue exactly where it stopped. Output only the remaining "
+                   "text, starting mid-line if needed. Do not repeat anything already written, do not restart, "
+                   "and do not add commentary.")
+MAX_HISTORY_CHARS = 70_000  # keeps the conversation inside the 32K-token context window
 
 BASE = "You are a precise senior software engineer. Be concise and correct."
 MODES = {
@@ -33,7 +38,7 @@ MODES = {
 
 F_OUT  = ("-o FILE", "save the code (or answer) to FILE")
 F_TEMP = ("-t TEMP", "creativity 0.0-1.0 (default 0.2)")
-F_MAX  = ("-m N",    "max tokens to generate (default 2048)")
+F_MAX  = ("-m N",    "max tokens per reply (default 8192; long replies auto-continue)")
 COMMON = [F_OUT, F_TEMP, F_MAX]
 
 COMMANDS = {
@@ -80,9 +85,10 @@ STATE = {"url": "", "key": "", "history": [], "piped": ""}
 TTY = sys.stdout.isatty()
 
 
-def dim(s):  return f"\033[2m{s}\033[0m" if TTY else s
-def bold(s): return f"\033[1m{s}\033[0m" if TTY else s
-def red(s):  return f"\033[31m{s}\033[0m" if TTY else s
+def dim(s):    return f"\033[2m{s}\033[0m" if TTY else s
+def italic(s): return f"\033[3m{s}\033[0m" if TTY else s
+def bold(s):   return f"\033[1m{s}\033[0m" if TTY else s
+def red(s):    return f"\033[31m{s}\033[0m" if TTY else s
 
 
 class UserError(Exception):
@@ -94,7 +100,7 @@ def load_config():
     cfg = {}
     for path in (CONFIG_PATH, LEGACY_CONFIG_PATH):
         try:
-            cfg = json.loads(path.read_text())
+            cfg = json.loads(path.read_text(encoding="utf-8"))
             break
         except Exception:
             continue
@@ -103,14 +109,25 @@ def load_config():
 
 
 def save_config():
-    CONFIG_PATH.write_text(json.dumps({"url": STATE["url"], "key": STATE["key"]}))
+    data = json.dumps({"url": STATE["url"], "key": STATE["key"]}, indent=2)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        os.chmod(CONFIG_PATH, 0o600)
+        fd = os.open(str(CONFIG_PATH), flags, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
     except OSError:
-        pass
+        CONFIG_PATH.write_text(data, encoding="utf-8")
+        try:
+            os.chmod(CONFIG_PATH, 0o600)
+        except OSError:
+            pass
 
 
 def health():
+    if not STATE["url"]:
+        return False
     try:
         req = urllib.request.Request(STATE["url"] + "/health", headers=UA)
         with urllib.request.urlopen(req, timeout=10) as r:
@@ -121,14 +138,16 @@ def health():
 
 # ----------------------------------------------------------------------------- model call
 def stream_chat(messages, temp, max_tokens):
-    """Stream a reply to the terminal. Returns the text (partial if interrupted with Ctrl+C), or None on error."""
+    """Stream a reply to the terminal. Returns (text, finish_reason); finish_reason is "length" when the reply
+    hit the token limit. Returns (None, None) on error. Text is partial if interrupted with Ctrl+C."""
     if not STATE["url"] or not STATE["key"]:
         print(red("Not connected. Type /connect <url> <key>, or set ASK_URL and ASK_KEY."))
-        return None
+        return None, None
     body = json.dumps({"messages": messages, "max_tokens": max_tokens, "temperature": temp, "stream": True}).encode()
     req = urllib.request.Request(STATE["url"] + "/v1/chat/completions", data=body, headers={
         "Content-Type": "application/json", "Authorization": "Bearer " + STATE["key"], **UA})
-    text = ""
+    text, finish = "", None
+    in_reasoning = False
     try:
         with urllib.request.urlopen(req, timeout=600) as r:
             print()
@@ -140,18 +159,39 @@ def stream_chat(messages, temp, max_tokens):
                     payload = line[5:].strip()
                     if payload == "[DONE]":
                         break
-                    delta = json.loads(payload)["choices"][0].get("delta", {}).get("content") or ""
-                    text += delta
-                    print(delta, end="", flush=True)
+                    try:
+                        chunk = json.loads(payload)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = chunk.get("choices")
+                    if not choices:
+                        continue
+                    choice = choices[0]
+                    delta = choice.get("delta", {})
+                    reasoning = delta.get("reasoning_content") or ""
+                    content = delta.get("content") or ""
+                    finish = choice.get("finish_reason") or finish
+
+                    if reasoning:
+                        if not in_reasoning:
+                            print(dim(italic("[thinking...] ")), end="", flush=True)
+                            in_reasoning = True
+                        print(dim(reasoning), end="", flush=True)
+                    if content:
+                        if in_reasoning:
+                            print()  # end reasoning section
+                            in_reasoning = False
+                        text += content
+                        print(content, end="", flush=True)
             except KeyboardInterrupt:
                 print(dim("\n[interrupted]"), end="")
             print("\n")
-        return text
+        return text, finish
     except urllib.error.HTTPError as e:
         print(red(f"HTTP {e.code}: {e.read().decode(errors='replace')[:300]}"))
     except Exception as e:
         print(red(f"Request failed (is the Kaggle session still running? try /status): {e}"))
-    return None
+    return None, None
 
 
 def trim_history():
@@ -160,19 +200,47 @@ def trim_history():
         del h[:2]
 
 
-def ask(mode, content, temp=0.2, max_tokens=2048):
+def merge_continuation(prev, more):
+    """Join a continuation onto the earlier text. If we were inside an unclosed code block and the model
+    reopened it with a fence such as ```html or ```, drop that repeated fence."""
+    if prev.count("```") % 2 == 1:
+        m = re.match(r"^\s*```[A-Za-z0-9_+.-]*[ \t]*\r?\n", more)
+        if m:
+            more = more[m.end():]
+    return prev + more
+
+
+def ask(mode, content, temp=0.2, max_tokens=DEFAULT_MAX_TOKENS):
     system = BASE + (" " + MODES[mode] if mode else "")
-    messages = [{"role": "system", "content": system}] + STATE["history"] + [{"role": "user", "content": content}]
-    text = stream_chat(messages, temp, max_tokens)
-    if text is not None:
-        STATE["history"] += [{"role": "user", "content": content}, {"role": "assistant", "content": text}]
-        trim_history()
+    base = [{"role": "system", "content": system}] + STATE["history"] + [{"role": "user", "content": content}]
+    text, finish = stream_chat(base, temp, max_tokens)
+    if text is None:
+        return None
+    rounds = 0
+    while finish == "length" and rounds < MAX_CONTINUES:
+        rounds += 1
+        print(dim(f"[reached the {max_tokens}-token limit; asking the model to continue ({rounds}/{MAX_CONTINUES})]"))
+        more, finish = stream_chat(base + [{"role": "assistant", "content": text},
+                                           {"role": "user", "content": CONTINUE_PROMPT}], temp, max_tokens)
+        if more is None:
+            break
+        text = merge_continuation(text, more)
+    if finish == "length":
+        print(red("Still cut off. Raise the limit with -m 16384, or ask for one part at a time "
+                  "(for example: the HTML first, then the CSS)."))
+    STATE["history"] += [{"role": "user", "content": content}, {"role": "assistant", "content": text}]
+    trim_history()
     return text
 
 
 def first_block(text):
-    m = re.search(r"```[a-zA-Z0-9_+-]*\n(.*?)```", text, re.S)
-    return m.group(1) if m else text
+    """Return the first fenced code block. Works even if the closing fence is missing (a cut-off reply)."""
+    m = re.search(r"```[A-Za-z0-9_+.-]*[ \t]*\r?\n", text)
+    if not m:
+        return text
+    rest = text[m.end():]
+    closing = re.search(r"^```", rest, re.M)
+    return rest[:closing.start()] if closing else rest
 
 
 # ----------------------------------------------------------------------------- parsing
@@ -193,6 +261,9 @@ def parse_args(name, rest):
     toks, i = split_line(rest), 0
     while i < len(toks):
         t = toks[i]
+        if t in ("-h", "--help"):
+            out["help"] = True
+            return out
         if t in FLAG_DEST and t in allowed:
             dest, takes = FLAG_DEST[t]
             if takes:
@@ -211,18 +282,23 @@ def parse_args(name, rest):
         i += 1
     try:
         out["temp"] = float(out.get("temp", 0.2))
-        out["max_tokens"] = int(out.get("max_tokens", 2048))
+        out["max_tokens"] = int(out.get("max_tokens", DEFAULT_MAX_TOKENS))
     except ValueError:
-        raise UserError("-t must be a number like 0.2 and -m a whole number like 2048")
+        raise UserError("-t must be a number like 0.2 and -m a whole number like 8192")
     out["text"] = " ".join(out["text"])
     return out
 
 
 def read_file_block(path):
     p = Path(path).expanduser()
+    if p.is_dir():
+        raise UserError(f"'{path}' is a directory, not a file. Attach individual files instead.")
     if not p.is_file():
         raise UserError(f"File not found: {path}")
-    data = p.read_text(encoding="utf-8", errors="replace")
+    try:
+        data = p.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        raise UserError(f"Cannot read {path}: {e}")
     note = ""
     if len(data) > MAX_FILE_CHARS:
         data, note = data[:MAX_FILE_CHARS], f"\n[truncated to {MAX_FILE_CHARS} characters]"
@@ -236,6 +312,8 @@ def run_capture(cmd, timeout=120):
         return r.returncode, out[-6000:]
     except subprocess.TimeoutExpired:
         return -1, f"(timed out after {timeout}s)"
+    except Exception as e:
+        return -1, f"(failed to execute: {e})"
 
 
 def build_content(args, extra=()):
@@ -250,8 +328,13 @@ def build_content(args, extra=()):
 
 def save_output(path, text, as_code):
     data = first_block(text).strip("\n") if as_code and "```" in text else text.strip()
-    Path(path).expanduser().write_text(data + "\n", encoding="utf-8")
-    print(dim(f"saved to {path}"))
+    p = Path(path).expanduser()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(data + "\n", encoding="utf-8")
+        print(dim(f"saved to {path}"))
+    except OSError as e:
+        raise UserError(f"Cannot save to {path}: {e}")
 
 
 # ----------------------------------------------------------------------------- commands
@@ -323,13 +406,20 @@ def cmd_shell(args):
 
 
 def cmd_generic(name, args):
+    if args.get("help"):
+        print_help(name)
+        return
     spec = COMMANDS[name]
     extra = []
     if name == "commit":
+        if not shutil.which("git"):
+            raise UserError("git is not installed or not on your PATH.")
         git = "git diff --staged" if args.get("staged") else "git diff HEAD"
         code, out = run_capture(git)
         if code != 0 and not args.get("staged"):
             code, out = run_capture("git diff")
+        if code != 0 and args.get("staged"):
+            code, out = run_capture("git diff --cached")
         if code != 0 or not out.strip():
             raise UserError("No git changes found to describe." if code == 0 else f"git failed: {out[:200]}")
         extra.append("Diff:\n" + out[-30_000:])
@@ -384,9 +474,19 @@ def handle(line):
 
 def parse_args_chat(line):
     toks = split_line(line)
-    files = [t[1:] for t in toks if t.startswith("@") and len(t) > 1]
-    text = " ".join(t if not (t.startswith("@") and len(t) > 1) else t[1:] for t in toks)
-    return {"text": text, "files": files, "temp": 0.2, "max_tokens": 2048}
+    files, text_toks = [], []
+    for t in toks:
+        if t.startswith("@") and len(t) > 1:
+            candidate = t[1:]
+            cand_path = Path(candidate).expanduser()
+            # Treat as file only if it actually exists as a file/dir on disk or explicitly contains a path separator
+            if cand_path.is_file() or "/" in candidate or "\\" in candidate:
+                files.append(candidate)
+                text_toks.append(candidate)
+                continue
+        text_toks.append(t)
+    text = " ".join(text_toks)
+    return {"text": text, "files": files, "temp": 0.2, "max_tokens": DEFAULT_MAX_TOKENS}
 
 
 # ----------------------------------------------------------------------------- the / menu

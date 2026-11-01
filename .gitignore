@@ -1,0 +1,8 @@
+.venv/
+borrow.egg-info/
+build/
+dist/
+__pycache__/
+*.py[cod]
+.borrow.json
+.borrow_history
