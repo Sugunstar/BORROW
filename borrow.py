@@ -11,7 +11,7 @@ No flags to remember: type /help for every command, its flags and what it does.
 import difflib, json, os, re, secrets, shlex, shutil, subprocess, sys, threading, time, urllib.error, urllib.request
 from pathlib import Path
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 CONFIG_PATH = Path.home() / ".borrow.json"
 LEGACY_CONFIG_PATH = Path.home() / ".qwen_cli.json"   # older versions saved here
 HISTORY_PATH = Path.home() / ".borrow_history"
@@ -278,6 +278,7 @@ def stream_chat(messages, temp, max_tokens, top_p=0.8, top_k=20, repeat_penalty=
     text, finish = "", None
     tool_calls_acc = []
     in_reasoning = False
+    in_tool_call = False
     tokens = 0
     spinner = Spinner(status_label or "Waiting for response...")
     spinner.start()
@@ -319,6 +320,26 @@ def stream_chat(messages, temp, max_tokens, top_p=0.8, top_k=20, repeat_penalty=
                             if fn.get("arguments"):
                                 tool_calls_acc[idx]["function"]["arguments"] += fn["arguments"]
 
+                        tokens += 1
+                        if not in_tool_call:
+                            in_tool_call = True
+                            if not silent and text and not text.endswith("\n"):
+                                sys.stdout.write("\n")
+                                sys.stdout.flush()
+
+                        fn_name = ""
+                        for tc in tool_calls_acc:
+                            if tc.get("function", {}).get("name"):
+                                fn_name = tc["function"]["name"]
+                                break
+                        lbl = f"Preparing {cyan(fn_name)}..." if fn_name else "Preparing tool action..."
+                        if not spinner.running:
+                            spinner.message = lbl
+                            spinner.tokens = tokens
+                            spinner.start()
+                        else:
+                            spinner.update(lbl, tokens=tokens)
+
                     if reasoning:
                         tokens += 1
                         if not silent:
@@ -348,7 +369,7 @@ def stream_chat(messages, temp, max_tokens, top_p=0.8, top_k=20, repeat_penalty=
                 return (text, finish, valid_tcs) if tools is not None else (text, finish)
             finally:
                 spinner.stop()
-            if not silent:
+            if not silent and not in_tool_call:
                 print("\n")
         valid_tcs = [tc for tc in tool_calls_acc if tc["function"]["name"]]
         if tools is not None:
@@ -696,29 +717,34 @@ def tool_search_files(query, path="."):
     except re.error as e:
         return f"Invalid regex pattern '{query}': {e}"
 
-    matches = []
-    cwd = Path.cwd()
-    for root, dirs, files in os.walk(p):
-        dirs[:] = [d for d in dirs if d not in ignored]
-        for f in sorted(files):
-            file_path = Path(root) / f
-            try:
-                with file_path.open("rb") as fp:
-                    if b"\x00" in fp.read(1024):
-                        continue
-                with file_path.open("r", encoding="utf-8", errors="ignore") as fp:
-                    for lnum, line in enumerate(fp, 1):
-                        if regex.search(line):
-                            try:
-                                rel = file_path.relative_to(cwd)
-                            except ValueError:
-                                rel = file_path
-                            matches.append(f"{rel}:{lnum}: {line.strip()[:150]}")
-                            if len(matches) >= 50:
-                                return "Search results (capped at 50):\n" + "\n".join(matches)
-            except OSError:
-                continue
-    return "Search results:\n" + ("\n".join(matches) if matches else "No matches found.")
+    spinner = Spinner(f"Searching for '{query}'...")
+    spinner.start()
+    try:
+        matches = []
+        cwd = Path.cwd()
+        for root, dirs, files in os.walk(p):
+            dirs[:] = [d for d in dirs if d not in ignored]
+            for f in sorted(files):
+                file_path = Path(root) / f
+                try:
+                    with file_path.open("rb") as fp:
+                        if b"\x00" in fp.read(1024):
+                            continue
+                    with file_path.open("r", encoding="utf-8", errors="ignore") as fp:
+                        for lnum, line in enumerate(fp, 1):
+                            if regex.search(line):
+                                try:
+                                    rel = file_path.relative_to(cwd)
+                                except ValueError:
+                                    rel = file_path
+                                matches.append(f"{rel}:{lnum}: {line.strip()[:150]}")
+                                if len(matches) >= 50:
+                                    return "Search results (capped at 50):\n" + "\n".join(matches)
+                except OSError:
+                    continue
+        return "Search results:\n" + ("\n".join(matches) if matches else "No matches found.")
+    finally:
+        spinner.stop()
 
 
 def tool_run_command(command, auto_approve=False):
@@ -726,7 +752,8 @@ def tool_run_command(command, auto_approve=False):
     if not auto_approve and not STATE.get("auto_approve"):
         if not prompt_confirm(f"Execute `{command}`?"):
             return f"User declined to run command: {command}"
-    print(dim(f"Running: {command}..."))
+    spinner = Spinner(f"Running `{command}`...")
+    spinner.start()
     try:
         r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=120)
         out = (r.stdout + r.stderr).strip()
@@ -736,6 +763,8 @@ def tool_run_command(command, auto_approve=False):
         return f"Command `{command}` timed out after 120 seconds."
     except Exception as e:
         return f"Execution error: {e}"
+    finally:
+        spinner.stop()
 
 
 def execute_tool(name, args, auto_approve=False):
@@ -774,19 +803,33 @@ def get_workspace_summary(max_files=60):
     return "\n".join(f"- {f}" for f in sorted(files_list))
 
 
+def is_pure_greeting(text):
+    cleaned = re.sub(r"[^\w\s]", "", text.strip().lower())
+    greetings = {
+        "hi", "hello", "hey", "greetings", "good morning", "good afternoon",
+        "good evening", "howdy", "sup", "yo", "hi there", "hello there", "hey there",
+        "who are you", "what can you do", "help", "thanks", "thank you"
+    }
+    return cleaned in greetings
+
+
 def run_agent(prompt, auto_approve=False, max_turns=12):
     """Autonomous agent loop supporting tool calling, file reading, editing, and commands."""
     ws_tree = get_workspace_summary()
     system_prompt = (
         BASE + "\n\n"
         "You are an autonomous pair-programming agent running in the user's terminal workspace (like Claude Code or agy).\n"
-        "You have tools to inspect files, make direct in-place edits, write new files, search, and run commands.\n"
-        "Workflows:\n"
-        "1. When the user asks to modify, inspect, or fix code, first read the file with `read_file` or search with `search_files`.\n"
-        "2. To modify existing code, use `edit_file` with the exact target text and replacement.\n"
-        "3. Only use `write_file` for new files or complete rewrites.\n"
-        "4. When appropriate, run tests or verify your work with `run_command`.\n"
-        "5. Explain concisely what you did when done.\n\n"
+        "You have tools to inspect files, make direct in-place edits, write new files, search, and run commands.\n\n"
+        "CRITICAL BEHAVIOR RULES:\n"
+        "1. ONLY use tools when the user's request requires interacting with files, code, or the terminal.\n"
+        "2. NEVER proactively call tools (such as list_directory, read_file, or write_file) for greetings (e.g. 'hi', 'hello'), general conversation, or conceptual questions. Just respond politely and ask how you can help.\n"
+        "3. NEVER create files or edit code unless the user explicitly requested you to build, change, or create something.\n"
+        "4. When the user DOES ask to modify, fix, or inspect code:\n"
+        "   - First read the file with `read_file` or search with `search_files`.\n"
+        "   - To modify existing code, use `edit_file` with the exact target text and replacement.\n"
+        "   - Only use `write_file` for brand new files or full rewrites.\n"
+        "   - Verify your work with `run_command` when appropriate.\n"
+        "   - Be concise and explain what you did when done.\n\n"
         f"Workspace Directory: {Path.cwd()}\n"
         f"Workspace Files:\n{ws_tree}\n"
     )
@@ -798,10 +841,13 @@ def run_agent(prompt, auto_approve=False, max_turns=12):
 
     turns = 0
     final_text = ""
+    use_tools = None if is_pure_greeting(prompt) else TOOLS
     while turns < max_turns:
         turns += 1
-        res = stream_chat(messages, temp=0.2, max_tokens=DEFAULT_MAX_TOKENS, tools=TOOLS)
+        step_lbl = f"Thinking (step {turns}/{max_turns})..." if turns > 1 else "Thinking..."
+        res = stream_chat(messages, temp=0.2, max_tokens=DEFAULT_MAX_TOKENS, tools=use_tools, status_label=step_lbl)
         text, finish, tool_calls = res[0], res[1], res[2] if len(res) > 2 else []
+        use_tools = TOOLS
 
         if text:
             final_text += text
