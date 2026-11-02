@@ -1,17 +1,16 @@
 # BORROW - Brain On Remote, Run On Workstation
 
-Chat with a strong open coding model (**Qwen3-Coder-30B-A3B**) from your own terminal, in the style of Claude Code:
-type `/` to open a command menu, `@file` to attach files, or plain text to chat. The model runs for free on
-Kaggle's dual T4 GPUs and reaches your computer through a free Cloudflare tunnel.
+Autonomous terminal coding agent (**Claude Code & agy style**) powered by a self-hosted open coder model (**Qwen2.5-Coder / Qwen3-Coder**).
+The model runs for free on Kaggle's dual Tesla T4 GPUs and connects directly to your local workstation through an encrypted Cloudflare quick tunnel.
 
-No GPU of your own and no paid services needed.
+No local GPU, no API subscription fees, and no closed-source vendor lock-in.
 
 ```
- Your computer                          Internet                    Kaggle notebook (2x T4 GPUs)
-┌────────────────────┐   HTTPS + API key   ┌────────────────┐   ┌───────────────────────────────┐
-│ borrow             │ ──────────────────► │ Cloudflare     │──►│ llama-server (llama.cpp, CUDA) │
-│ (this CLI)         │ ◄────────────────── │ quick tunnel   │◄──│ Qwen3-Coder-30B-A3B  (Q4_K_M)  │
-└────────────────────┘     streamed tokens └────────────────┘   └───────────────────────────────┘
+ Your workstation (terminal)            Internet                     Kaggle notebook (2x T4 GPUs)
+┌────────────────────────┐   HTTPS + API key   ┌────────────────┐    ┌───────────────────────────────┐
+│ borrow                 │ ──────────────────► │ Cloudflare     │───►│ llama-server (llama.cpp, CUDA)│
+│ (Autonomous Agent CLI) │ ◄────────────────── │ quick tunnel   │◄───│ Qwen2.5-Coder-32B / 30B MoE   │
+└────────────────────────┘   streamed tokens   └────────────────┘    └───────────────────────────────┘
 ```
 
 ## Contents
@@ -20,10 +19,12 @@ No GPU of your own and no paid services needed.
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
 - [Using the CLI](#using-the-cli)
+- [Autonomous Agent Workflows](#autonomous-agent-workflows)
 - [Talking to the model](#talking-to-the-model)
 - [Commands](#commands)
 - [Attaching files](#attaching-files)
 - [One-shot mode](#one-shot-mode)
+- [Automated Testing & QA](#automated-testing--qa)
 - [Settings and saved data](#settings-and-saved-data)
 - [Choosing a model](#choosing-a-model)
 - [Limits and honest expectations](#limits-and-honest-expectations)
@@ -35,293 +36,282 @@ No GPU of your own and no paid services needed.
 
 | File | Runs on | Purpose |
 |---|---|---|
-| `qwen_serv.py` | Kaggle notebook | Builds llama.cpp with CUDA, downloads the model, starts the server, opens the tunnel and prints your connection details |
-| `borrow.py` + `pyproject.toml` | Your computer | The `borrow` command: `/` command menu, `@file` attachments, streaming replies and chat memory |
+| `qwen_serv.py` | Kaggle notebook | Prebuilt CUDA `llama-server`, fast Hugging Face model downloads, starts OpenAI-compatible API server, and opens Cloudflare tunnel |
+| `borrow.py` + `pyproject.toml` | Your workstation | The `borrow` CLI: Autonomous agent loop, tool execution (read/edit/write/search/run), interactive colored diffs, live streaming spinners, command menu, and chat memory |
 
-Observed in one real run on 2x Tesla T4: about **58-68 tokens/second** with the 30B coder model
-(only about 3B parameters are active per token, which is why it is fast).
+Observed performance on Kaggle 2x Tesla T4:
+- **Qwen3-Coder-30B-A3B (MoE):** ~58–68 tokens/second (3.3B active parameters per token).
+- **Qwen2.5-Coder-32B-Instruct (Dense):** ~14–18 tokens/second (highest accuracy on multi-file coding and subtle bugs).
 
 ## Requirements
 
 **Kaggle side**
-- A Kaggle account with a **verified phone number** (needed to turn Internet on).
-- In the notebook's right sidebar, under **Session options**:
+- A Kaggle account with a **verified phone number** (needed for Internet access).
+- In the notebook's right sidebar under **Session options**:
   - **Accelerator: GPU T4 x2**
   - **Internet: On**
 
 **Your computer**
-- Python 3.8 or newer. Nothing else is required.
-- `prompt_toolkit` powers the `/` menu. Installing `borrow` (below) pulls it in for you. If it is missing, the CLI
-  tries to install it on first run, and otherwise falls back to a basic mode with Tab completion and no dropdown.
-- Optional: `git` (for `/commit`).
+- Python 3.8 or newer.
+- `prompt_toolkit` powers the `/` menu (automatically installed by `pipx` or `pip`).
+- Optional: `git` (for `/diff`, `/revert`, `/commit`).
 
 ## Quick start
 
 ### 1. Start the model on Kaggle
 
-1. Create a new Kaggle notebook and set the accelerator and Internet as described above.
-2. Paste the **entire** contents of `qwen_serv.py` into **one code cell** and run it.
-3. The script automatically fetches prebuilt CUDA-accelerated `llama-server` binaries and enables
-   multi-stream downloads (`hf-transfer`), dropping initial setup from ~30 minutes down to **~3–5 minutes**.
-   *(Tip: If you mount the GGUF model as a Kaggle Dataset in `/kaggle/input`, setup finishes in **~1–2 minutes** with 0s download time).*
-   You will see progress as `[1/6] ... [6/6]`.
-4. When it finishes, the output ends with a ready-to-paste line like:
+1. Create a new Kaggle notebook and set **Accelerator: GPU T4 x2** and **Internet: On**.
+2. Paste the **entire** contents of `qwen_serv.py` into a single code cell and click **Run**.
+3. Setup fetches prebuilt CUDA-accelerated `llama-server` binaries and runs high-speed downloads, completing in **~3–5 minutes**.
+   *(Tip: Mounting the GGUF model as a Kaggle Dataset finishes setup in **~1–2 minutes**).*
+4. Once ready, the cell prints:
 
    ```
    /connect https://some-random-words.trycloudflare.com YOUR_KEY
    ```
 
-5. **Leave the cell running.** It holds the server open. Stopping the cell shuts everything down.
+5. **Leave the cell running.** Stopping the cell shuts down the server.
 
-### 2. Install `borrow` on your computer (once)
+### 2. Install `borrow` on your computer
 
-Put `borrow.py`, `pyproject.toml` and this README in one folder, open a terminal there, and run **one** of:
+In the project directory, run:
 
 ```bash
-pipx install .        # recommended: isolated, and puts `borrow` on your PATH
-pip install .         # also works
-pip install -e .      # editable: changes to borrow.py take effect immediately
+pipx install --editable .     # Recommended: isolated, puts `borrow` on your PATH, auto-syncs edits
 ```
 
-Check it worked:
+Or with `pip`:
+
+```bash
+pip install -e .
+```
+
+Verify the installation:
 
 ```bash
 borrow --version
 ```
 
-If your shell says `borrow: command not found` after `pip install`, the folder that pip puts commands in is not on
-your PATH. Use `pipx install .` (then run `pipx ensurepath` and open a new terminal), or add pip's scripts folder to
-your PATH. You can always run it without installing: `python borrow.py`.
+### 3. Connect and code
 
-### 3. Connect and chat
+Launch the interactive CLI:
 
 ```bash
 borrow
 ```
 
-Paste the `/connect ...` line from the Kaggle output:
+Paste your `/connect` line:
 
 ```
 /connect https://some-random-words.trycloudflare.com YOUR_KEY
 ```
 
-The CLI saves the endpoint, checks the server and prints `saved. server reachable.` Then try it:
+The CLI saves your credentials to `~/.borrow.json`, verifies the connection, and reports `saved. server reachable.`
+
+Now you can chat with the agent or request code edits:
 
 ```
-/code a python function that merges two sorted lists
+> build a simple flask app in app.py and add a test in test_app.py
 ```
 
 ### 4. Next time
 
-Kaggle clears everything between sessions, so each new session gives a **new URL and key**. Run the Kaggle cell
-again (the build and download repeat), then run `/connect` with the new values.
+Kaggle sessions are ephemeral. When you start a new Kaggle notebook session, run `qwen_serv.py` and run `/connect` with the newly generated URL and key.
 
 ## Using the CLI
 
-- Type **`/`** to open the command menu: every command with a one-line description. Keep typing to filter, and use
-  the arrow keys or Tab to choose.
-- After a command, type **`-`** to see that command's flags.
-- Type **`@`** to attach files. Tab completes paths.
-- Type **plain text** or use **`/edit`** to ask the autonomous agent to inspect, edit, or test files in your current directory.
-- **Ctrl+C** stops a reply while it is being generated. **Ctrl+D** or `/exit` quits.
-- `/help` lists every command with its flags and what it does. `/help review` shows one command with an example.
-- `borrow --help` prints the same help from your normal shell, and `borrow --version` prints the version.
+- **Interactive Autonomous Agent:** Simply type instructions in plain English (e.g. `refactor auth.py to use JWT` or `fix the failing pytest`).
+- Type **`/`** to open the interactive command dropdown menu. Filter by typing and navigate with arrow keys or Tab.
+- Type **`-`** after any command to view supported flags.
+- Type **`@`** to attach files with Tab autocomplete (e.g. `@app.py`).
+- **Confirmation Prompts:** The agent previews exact unified diffs and command runs, asking `[Y/n/a(ll)]`. Press `a` to auto-approve remaining actions for that session.
+- **Ctrl+C** stops current generation or running command. **Ctrl+D** or `/exit` exits the agent.
+
+## Autonomous Agent Workflows
+
+Like Claude Code and `agy`, `borrow` operates as a true autonomous software engineer:
+
+```
+ User Request ──► Agent ReAct Loop ──► Tool Call (read/edit/search/exec)
+      ▲                     │                         │
+      │                     ▼                         ▼
+      └────────── Response / Final Answer ◄── Confirmation & Tool Output
+```
+
+### Native Tool Suite
+1. **`read_file(path, start_line, end_line)`**: Inspects workspace files with optional line slicing.
+2. **`edit_file(path, target, replacement)`**: Applies surgical, exact in-place string replacements.
+3. **`write_file(path, content)`**: Creates new files or overwrites existing files atomically.
+4. **`list_directory(path)`**: Explores folder structures, skipping ignored directories (`.git`, `__pycache__`, etc.).
+5. **`search_files(query, path)`**: Regex-powered workspace search across text files.
+6. **`run_command(command)`**: Executes shell commands (e.g. `pytest`, `python app.py`, `npm test`) with output capture and 120s timeout.
+
+### Safety & Control
+- **Interactive Colored Diffs**: Every file modification displays an ANSI unified diff preview (`+added`, `-removed`, `@@hunk@@`).
+- **Confirmation Guard**: Interactive prompt `[Y/n/a(ll)]` protects your filesystem and terminal.
+- **Auto-Approve Toggle**: Use the `/auto` command or the CLI `-y` / `--yes` flag to run completely autonomously.
+- **Git Revert & Diff**: Inspect workspace git state with `/diff` or undo file changes with `/revert <file>`.
+- **Greeting & Intent Guard**: Conversational greetings (`hi`, `hello`, `who are you?`) are handled naturally without unprompted file creations or unsolicited directory scans.
+
+### Live Visual Feedback
+- **Braille Spinner & Token Counters**: When the model prepares tool arguments or reasons through steps, a real-time animated spinner displays the tool name and accumulated token count:
+  ```
+  ⠋ Preparing write_file... (214 tokens)
+  ```
+- **Execution Spinners**: Live animated feedback while running shell commands or scanning files.
 
 ## Talking to the model
 
-**Autonomous Agent & Chat.** Anything you type without a leading `/` (or using `/edit`) engages the autonomous agent.
-Like Claude Code or `agy`, the agent can:
-- Explore your current workspace and read files on demand (`read_file`, `search_files`).
-- Propose and apply exact, in-place edits to your files (`edit_file`, `write_file`) with interactive colored unified diffs.
-- Run tests and shell commands (`run_command`) to verify its changes.
-- Every edit asks for confirmation `[Y/n/a(ll)]` before touching disk (or use `-y` / `/auto` to auto-approve).
+**Natural Coding Prompts:**
+```
+> inspect index.html and style.css and make the layout responsive for mobile
+> run the unit tests and fix whatever fails
+> add type annotations to utils.py
+```
 
-**Memory.** The conversation has memory, so follow-ups work: after `/review @app.py` you can simply type
-`fix the second issue` or `show me the corrected function`. Use `/clear` to start fresh. History is trimmed
-automatically from the oldest messages to stay inside the model's context window.
-
-**Commands.** A `/command` sends a request with task-specific instructions (for example "reply with code only" for
-`/code`). Its question and answer join the same conversation, so you can keep talking about the result.
-
-**Saving output.** Add `-o FILE` to save the model's code to a file, for example `/code a flask hello world -o app.py`.
-For `/code`, `/test`, `/doc` and `/fix` it saves just the first code block.
+**Task Modes:**
+Prefixing prompts with a command sends specialized system instructions:
+```
+/code a python script that scrapes hacker news headlines -o hn.py
+/review @app.py focus on security vulnerabilities and race conditions
+/test @borrow.py -o tests/test_borrow.py
+/fix @app.py --run "pytest tests/test_api.py"
+```
 
 ## Commands
 
 | Command | What it does | Flags |
 |---|---|---|
-| `/edit <instructions>` | Autonomous agent task: inspects, edits files, and runs commands | `-t TEMP` `-m N` |
-| `/code <what to build>` | Generates code only, no explanation | `-o FILE` `-t TEMP` `-m N` |
-| `/explain [@file ...] [question]` | Explains code or an error in plain language | `-o` `-t` `-m` |
-| `/review [@file ...] [focus]` | Strict code review, most important issues first | `-o` `-t` `-m` |
-| `/test [@file ...] [notes]` | Writes unit tests (pytest for Python unless told otherwise) | `-o` `-t` `-m` |
-| `/fix [@file ...] [error text]` | Fixes a bug from an error message or a command's output | `-o` `-t` `-m` `--run CMD` |
-| `/doc [@file ...]` | Adds docstrings and comments without changing behaviour | `-o` `-t` `-m` |
-| `/commit` | Writes a commit message from your git changes | `--staged` `-o` `-t` |
-| `/shell <what you want>` | Turns a request into one shell command, then asks before running it | `-t` |
-| `/diff` | Shows git diff of all workspace changes made so far | |
-| `/revert [file]` | Reverts uncommitted git changes in a file | |
-| `/auto` | Toggles auto-approving edits and commands without asking | |
-| `/clear` | Forgets the conversation so far | |
-| `/connect [<url> <key>]` | Sets or shows the endpoint (saved for next time) | |
-| `/status` | Checks that the server is reachable | |
-| `/help [command]` | Shows commands, flags and what they do | |
-| `/exit` | Quits | |
+| `/edit <instructions>` | Autonomous agent task: inspects, edits files, and runs verification | `-t TEMP` `-m N` |
+| `/auto` | Toggle auto-approving file edits and shell commands | |
+| `/diff` | Display `git diff` of uncommitted changes across workspace | |
+| `/revert [file]` | Revert uncommitted changes in a file (`git checkout -- <file>`) | |
+| `/code <what to build>` | Generate pure code without conversational filler | `-o FILE` `-t TEMP` `-m N` |
+| `/explain [@file ...] [q]` | Explain code, architecture, or an error in plain language | `-o` `-t` `-m` |
+| `/review [@file ...] [focus]` | Strict, prioritized code review | `-o` `-t` `-m` |
+| `/test [@file ...] [notes]` | Generate unit test suites (pytest by default) | `-o` `-t` `-m` |
+| `/fix [@file ...] [error]` | Fix bugs from an error trace or command output | `-o` `-t` `-m` `--run CMD` |
+| `/doc [@file ...]` | Add type hints and docstrings without modifying logic | `-o` `-t` `-m` |
+| `/commit` | Generate conventional commit messages from git diff | `--staged` `-o` `-t` |
+| `/shell <what you want>` | Translate natural language into a shell command with confirmation | `-t` |
+| `/connect [<url> <key>]` | Configure or view the active Cloudflare endpoint and API key | |
+| `/status` | Verify remote server connectivity and model health | |
+| `/clear` | Reset chat history and start a fresh session | |
+| `/help [command]` | Display detailed command reference and examples | |
+| `/exit` | Exit the CLI (or press `Ctrl+D`) | |
 
-**Flags**
+### Flags
 
-| Flag | Meaning |
+| Flag | Description |
 |---|---|
-| `-o FILE` | Save the result to FILE (code commands save just the first code block) |
-| `-t TEMP` | Creativity from 0.0 to 1.0 (default 0.2, a good value for code) |
-| `-m N` | Maximum tokens to generate (default 2048) |
-| `--run CMD` | (`/fix`) Run CMD first and send its output to the model as the error |
-| `--staged` | (`/commit`) Use only staged changes. The default is all uncommitted changes (`git diff HEAD`) |
-
-**Examples**
-
-```
-/code a python function that merges two sorted lists -o merge.py
-/review @app.py @utils.py focus on error handling
-/test @app.py -o test_app.py
-/fix @app.py --run "python app.py"
-/commit --staged
-/shell find files bigger than 100MB
-why is @app.py slow?
-```
-
-**Good to know**
-
-- `/shell` always shows the command and asks `Run it? [y/N]`. **Read it before answering yes.** The command was
-  written by a language model and can be wrong or destructive.
-- `/fix --run` executes the command you give it on your machine (120 second timeout) and sends its output to the
-  model.
-- `/commit` runs `git diff` for you, so there is nothing to pipe.
-- A misspelled command gets a suggestion, for example `/revew` suggests `/review`.
+| `-y`, `--yes` | Global flag: Auto-approve all file edits and commands without confirmation |
+| `-o FILE` | Save generated code or output directly to `FILE` |
+| `-t TEMP` | Sampling temperature between `0.0` and `1.0` (default `0.2` for code precision) |
+| `-m N` | Maximum tokens to generate (default: `8192`) |
+| `--run CMD` | (`/fix`) Execute `CMD` on workstation and pass stdout/stderr to the agent |
+| `--staged` | (`/commit`) Inspect only git staged changes (`git diff --cached`) |
 
 ## Attaching files
 
-Put `@` in front of a path, in any command or in plain chat:
+Attach local files to any query using `@`:
 
 ```
-/review @app.py
-/explain @src/utils.py what does the retry loop do?
-/review @app.py @utils.py focus on error handling
-why is @app.py slow?
+> why does @utils.py fail when passed None?
+/review @src/auth.py @src/models.py focus on SQL injection
+/fix @app.py --run "pytest"
 ```
 
-- Attach as many files as you like in one message.
-- Paths are relative to the folder you started the CLI in, so `cd` into your project first.
-- Tab after `@` completes file and folder names. Wrap paths containing spaces in quotes: `"@my notes.py"`.
-- Attached files stay in the conversation memory, so follow-ups do not need them again.
-- **Text files only** (source code, configs, logs, markdown, CSV). Images, PDFs and other binary files are not
-  supported.
-- Folders and wildcards (`@src/`, `@*.py`) are not supported; attach files one by one.
-- Files over 60,000 characters are truncated, with a note to the model.
-- Everything you attach plus the chat history must fit in the context window (32K tokens for the default model).
-  About 3-4 large files is a practical maximum.
+- Attach multiple files in a single turn.
+- Paths are relative to the current working directory.
+- Autocomplete file names with Tab. Wrap paths containing spaces in quotes (`"@my file.py"`).
+- Attached files are cached in conversation memory for subsequent follow-up questions.
 
 ## One-shot mode
 
-Run a single command from your normal shell without opening the interactive prompt:
+Execute autonomous tasks or queries directly from your shell or CI/CD pipelines without entering the interactive REPL:
 
 ```bash
-borrow /review @app.py
-git diff | borrow /review -      # a lone "-" means: read piped input
+# Autonomous edit with auto-approval
+borrow -y "add docstrings and type annotations to utils.py"
+
+# Review code piped from stdin
+git diff | borrow /review -
+
+# Fix bugs using test runner output
+borrow /fix @app.py --run "pytest"
 ```
+
+## Automated Testing & QA
+
+`borrow` contains an independent QA suite and unit tests:
+
+```bash
+# Run the test suite
+pytest -v
+```
+
+Features tested:
+- Tool execution: `tool_read_file`, `tool_edit_file`, `tool_write_file`, `tool_list_directory`, `tool_search_files`, `tool_run_command`.
+- Workspace protection and directory boundary confinement.
+- Unified colored diff generation and fallback behavior.
+- Argument parsing, flag validation, and non-zero exit codes on errors.
+- Mock OpenAI-compatible streaming server and tool-call SSE streaming chunks.
 
 ## Settings and saved data
 
-- `/connect <url> <key>` saves the endpoint to `~/.borrow.json`. Prompt history is kept in `~/.borrow_history`. (Older
-  versions saved to `~/.qwen_cli.json`; `borrow` still reads that file if the new one does not exist.)
-- The environment variables `ASK_URL` and `ASK_KEY` override the saved values:
+- Configuration is persisted at `~/.borrow.json` (URL and encrypted bearer key, `0600` permissions).
+- Prompt history is stored in `~/.borrow_history`.
+- Set environment variables `ASK_URL` and `ASK_KEY` to override saved configuration (ideal for CI/CD).
 
-  ```bash
-  export ASK_URL=https://new-url.trycloudflare.com ASK_KEY=NEW_KEY          # Mac / Linux
-  $env:ASK_URL='https://new-url.trycloudflare.com'; $env:ASK_KEY='NEW_KEY'  # PowerShell
-  ```
-
-- `/connect` with no arguments shows the current URL and the last 4 characters of the key. `/status` checks that the
-  server answers.
+```bash
+export ASK_URL=https://your-tunnel.trycloudflare.com
+export ASK_KEY=YOUR_SESSION_KEY
+```
 
 ## Choosing a model
 
-By default the Kaggle script picks a model from your total GPU memory. Edit the settings at the top of
-`qwen_serv.py`:
+`qwen_serv.py` includes built-in configurations at the top of the file:
 
 ```python
-MODEL_CHOICE = "auto"   # "auto" | "coder32b_dense" | "coder30b" | "coder14b_dense" | "qwen35_27b" | "qwen35_9b"
-THINKING     = True     # Enable reasoning/thinking when supported by the model (better accuracy)
+MODEL_CHOICE = "auto"   # "auto" | "coder32b_dense" | "coder30b" | "coder14b_dense" | "qwen35_27b"
+THINKING     = True     # Enable reasoning tokens when supported
 ```
 
-| Preset | Model | Context | Needs (total VRAM) | Notes |
+| Preset | Model | Context | Required VRAM | Characteristics |
 |---|---|---|---|---|
-| `coder32b_dense` | Qwen2.5-Coder-32B-Instruct, Q4_K_M (~19.8 GB) | 32768 | about 26 GB | **Highest accuracy**: dense 32B model, superior coding reasoning and bug detection. Slower (~12-18 tok/s). |
-| `coder30b` | Qwen3-Coder-30B-A3B-Instruct, Q4_K_M (~18.6 GB) | 32768 | about 26 GB | **Fast MoE**: 3.3B active parameters per token (~58-68 tok/s). Great for speed, lighter on deep logic. |
-| `coder14b_dense` | Qwen2.5-Coder-14B-Instruct, Q4_K_M (~9.0 GB) | 32768 | about 12 GB | Strong dense reasoning, fits even on a single GPU session (~25-35 tok/s). |
-| `qwen35_27b` | Qwen3.5-27B, Q4_K_M | 16384 | about 24 GB | General model with native thinking capability. |
-| `qwen35_9b` | Qwen3.5-9B, Q4_K_M | 16384 | about 10 GB | Fallback when only one GPU is available. |
-
-`auto` chooses `coder30b` when at least 26 GB of VRAM is visible, otherwise `coder14b_dense` or `qwen35_9b`. If you prioritize **accuracy over speed**, change `MODEL_CHOICE = "coder32b_dense"`.
+| `coder32b_dense` | Qwen2.5-Coder-32B-Instruct (Q4_K_M) | 32768 | ~26 GB | **Highest coding accuracy**: Best for complex multi-file agentic edits (~14–18 tok/s). |
+| `coder30b` | Qwen3-Coder-30B-A3B-Instruct (Q4_K_M) | 32768 | ~26 GB | **Blazing fast MoE**: 3.3B active parameters (~58–68 tok/s). Excellent responsiveness. |
+| `coder14b_dense` | Qwen2.5-Coder-14B-Instruct (Q4_K_M) | 32768 | ~12 GB | Balanced reasoning, fits on a single T4 GPU (~25–35 tok/s). |
 
 ## Limits and honest expectations
 
-- **Quality:** strong for functions, scripts, boilerplate, tests, SQL, regex, refactors and explaining errors.
-  Weaker than the best frontier models on large multi-file reasoning and subtle bugs. Review everything and run
-  tests. Use it as a fast scratchpad, not as an oracle.
-- **Not production infrastructure.** Do not put it in a product's request path.
-- **Sessions are temporary.** Kaggle limits weekly GPU hours and session length (check Kaggle's documentation for
-  current numbers). Every new session needs the 15-25 minute setup again and gives a new URL and key.
-- **Context window is 32K tokens** for the default model. Attach only the files you need.
-- **One shared GPU pair.** Fine for you and maybe a teammate, not for a whole team.
+- **Scratchpad, not an oracle**: Always review code changes before committing. While the agent features diff confirmation and verification loops, large multi-repo architecture tasks still benefit from human oversight.
+- **Ephemeral Kaggle Sessions**: Sessions are limited by Kaggle weekly quotas and idle timeouts. When a session terminates, restart the Kaggle cell and run `/connect` with the fresh URL.
+- **Context Limits**: The default context is 32K tokens. Keep attachments focused on relevant files.
 
 ## Security and privacy
 
-- **Anyone with the URL and the key can use your GPU session.** Treat the key like a password. Do not post
-  screenshots or logs that contain it. `~/.borrow.json` stores it in plain text (permissions are restricted where
-  the OS supports it); do not commit it to git.
-- The key is random per session and the server rejects requests without it. The tunnel URL alone is not enough.
-- **Your prompts and attached files travel through Cloudflare to a Kaggle machine.** Before sending proprietary
-  company code, get permission from your employer or founder. Never send secrets, API keys, credentials or
-  customer data.
-- **Terms of service:** this project has not verified that Kaggle's or Cloudflare's terms allow tunnelling from a
-  notebook. Check them for your situation.
-- **Model licence:** check the Qwen3-Coder licence on its Hugging Face page before commercial use.
+- **Bearer Key Protection**: The random bearer key generated on Kaggle prevents unauthorized access to your tunnel. Never share your `/connect` string publicly.
+- **Workstation Isolation**: Files are edited only within your active workspace. Diffs require user confirmation unless explicit auto-approval (`-y` or `/auto`) is granted.
+- **No Third-Party AI Data Collection**: Prompts flow directly from your workstation through an encrypted Cloudflare quick tunnel to your own private Kaggle instance.
 
 ## Troubleshooting
 
-| Symptom | Cause and fix |
+| Symptom | Resolution |
 |---|---|
-| `FAILED: No internet access (DNS lookup failed)` (Kaggle) | Internet is off. Sidebar > Session options > Internet > On. If the toggle is greyed out, verify your phone number in Kaggle account settings. Re-run the cell |
-| `No GPU found` (Kaggle) | Set Accelerator to **GPU T4 x2** and restart the session |
-| `CUDA::cuda_driver ... not found` during configure (Kaggle) | The script finds the driver library itself and falls back to `GGML_CUDA_NO_VMM=ON` automatically. If it still fails, check the last lines of `/tmp/qwen_server/cmake_configure.log` |
-| Build fails or the kernel dies while compiling (Kaggle) | Likely out of memory. Re-run the cell, then check `/tmp/qwen_server/cmake_build.log` |
-| `llama-server exited early` (Kaggle) | Read the log tail it prints (also `/tmp/qwen_server/server.log`). Try a smaller context by editing `ctx` in the preset, or use `qwen35_9b` |
-| Tunnel self-test fails inside Kaggle | That self-test is optional and non-fatal. Run `/connect` and `/status` from your own computer instead; that is the check that matters |
-| `Not connected` in the CLI | Run `/connect <url> <key>` with the values from the Kaggle output |
-| `HTTP 401` | Wrong or old key. Use the key from the current session's output |
-| `HTTP 530` / `1033`, or `/status` says NOT reachable | The session ended or the tunnel dropped. Re-run the Kaggle cell and `/connect` with the new URL and key |
-| `Request failed (is the Kaggle session still running?)` | Same as above; check the Kaggle tab |
-| No `/` dropdown | `pip install prompt_toolkit`, then restart `borrow`. Use a real terminal (some IDE consoles do not support it) |
-| `borrow /review -` hangs | The lone `-` waits for piped input. Pipe something in (`git diff \| borrow /review -`) or remove the `-` |
+| `Not connected` in CLI | Run `/connect <url> <key>` using the output from your Kaggle notebook |
+| `HTTP 401 Unauthorized` | Invalid key. Copy the fresh `/connect` command printed at the end of `qwen_serv.py` |
+| `HTTP 530 / 1033` or tunnel drops | Kaggle cell timed out or notebook stopped. Re-run `qwen_serv.py` on Kaggle |
+| `No / dropdown menu` | Install prompt toolkit: `pip install prompt_toolkit` and ensure you are in a real terminal |
+| Python command blocks in agent | Commands that start daemon/web servers (like `flask run` or `python app.py`) will run until the 120s timeout unless stopped |
 
 ## Files and log locations
 
-On Kaggle (the script chooses the location with the most free disk, usually `/tmp`):
+**On Kaggle:**
+- Server log: `/tmp/qwen_server/server.log`
+- Tunnel log: `/tmp/qwen_server/tunnel.log`
+- Model files: `/tmp/qwen_server/models/`
 
-| Path | Contents |
-|---|---|
-| `/tmp/qwen_server/llama.cpp/` | llama.cpp source and the built `llama-server` |
-| `/tmp/qwen_server/models/` | The downloaded GGUF model |
-| `/tmp/qwen_server/server.log` | Server log (shows GPU offload info) |
-| `/tmp/qwen_server/tunnel.log` | Cloudflare tunnel log |
-| `/tmp/qwen_server/cmake_configure.log`, `cmake_build.log` | Build logs |
-
-On your computer: `~/.borrow.json` (saved URL and key) and `~/.borrow_history` (prompt history).
-
-## Status
-
-Verified on a real Kaggle session (2x T4): build, model download, server start, tunnel, and a request through the
-tunnel from a separate machine. `borrow` was verified, including installing it into a clean virtual environment with `pip`, with automated tests against a mock server (command
-parsing, menu completions, streaming, file attachments, error handling); its behaviour in a real terminal, and on
-Windows, has had less testing. If something misbehaves, open an issue with your OS, terminal and the exact error.
+**On your workstation:**
+- Config: `~/.borrow.json`
+- REPL history: `~/.borrow_history`
