@@ -8,7 +8,7 @@ Connect:       set ASK_URL / ASK_KEY (printed by the Kaggle script) or type  /co
 Inside the CLI type  /  to open the command menu, @ to attach files, plain text to chat.
 No flags to remember: type /help for every command, its flags and what it does.
 """
-import difflib, json, os, re, shlex, shutil, subprocess, sys, urllib.error, urllib.request
+import difflib, json, os, re, shlex, shutil, subprocess, sys, threading, time, urllib.error, urllib.request
 from pathlib import Path
 
 __version__ = "0.1.1"
@@ -24,16 +24,57 @@ CONTINUE_PROMPT = ("Your previous reply was cut off. Continue exactly where it s
                    "and do not add commentary.")
 MAX_HISTORY_CHARS = 70_000  # keeps the conversation inside the 32K-token context window
 
-BASE = "You are a precise senior software engineer. Be concise and correct."
+BASE = (
+    "You are an expert senior software engineer and technical architect. "
+    "Produce correct, robust, production-ready solutions following modern best practices. "
+    "Prioritize correctness, edge-case safety, security, and clean idiomatic style. "
+    "Write maintainable code with proper error handling and without dummy or omitted logic."
+)
 MODES = {
-    "code":    "Reply with ONLY the code in a single fenced code block. No explanation.",
-    "explain": "Explain what the given code or error does in plain language, concisely, with bullet points.",
-    "review":  "Review the given code like a strict senior reviewer. List concrete bugs, risks and improvements, most important first.",
-    "test":    "Write thorough unit tests for the given code (pytest for Python unless told otherwise). Reply with only the test code in one fenced block.",
-    "fix":     "Find and fix the bug or error described. Reply with the corrected code in one fenced block, then 1-3 lines on the cause.",
-    "doc":     "Add clear docstrings and comments to the given code without changing behaviour. Reply with the full updated code in one fenced block.",
-    "commit":  "Write a concise conventional-commit message for the given diff: subject line under 72 chars, then optional bullets. Reply with only the message.",
-    "shell":   "Reply with ONLY a single bash command that does what is asked. No explanation, no code fence.",
+    "code": (
+        "Write the complete, production-ready implementation inside a single fenced code block. "
+        "Ensure the code handles edge cases and runtime failures, adheres to language conventions, "
+        "and includes concise inline comments explaining non-trivial logic."
+    ),
+    "explain": (
+        "Explain the given code or error clearly and concisely. Structure your answer with: "
+        "1) High-level purpose and architecture, "
+        "2) Step-by-step walkthrough of key logic and data flow, "
+        "3) Subtle edge cases, performance considerations, or potential pitfalls."
+    ),
+    "review": (
+        "Conduct a rigorous senior engineering code review. Systematically inspect for: "
+        "1) Correctness and edge-case bugs, "
+        "2) Security vulnerabilities and resource leaks, "
+        "3) Performance bottlenecks and code smells. "
+        "For each issue, state the severity ([Critical], [Warning], [Suggestion]), explain the exact risk, "
+        "and provide a concrete code fix or diff."
+    ),
+    "test": (
+        "Write a thorough, comprehensive unit test suite for the given code (using pytest for Python unless "
+        "specified otherwise). Include tests for standard use cases, boundary conditions, edge cases, invalid inputs, "
+        "and error handling. Reply with the runnable test code in a single fenced code block."
+    ),
+    "fix": (
+        "Analyze the bug, error message, or failure output thoroughly. "
+        "1. First identify and explain the exact root cause in 1-3 concise bullet points. "
+        "2. Then provide the complete, corrected code in a single fenced code block that resolves the issue "
+        "without introducing regressions."
+    ),
+    "doc": (
+        "Add clear, accurate docstrings and comments following standard conventions (such as PEP 257 / Google style "
+        "for Python). Document parameters, return values, exceptions, and non-obvious logic without modifying code behaviour. "
+        "Reply with the full documented code in a single fenced code block."
+    ),
+    "commit": (
+        "Write a concise conventional-commit message for the given diff: "
+        "subject line under 72 chars (e.g. feat:, fix:, refactor:), followed by optional bullet points highlighting key changes. "
+        "Reply with only the message."
+    ),
+    "shell": (
+        "Reply with ONLY a single, safe, effective bash command that accomplishes the request. "
+        "No explanation, no markdown code fence."
+    ),
 }
 
 F_OUT  = ("-o FILE", "save the code (or answer) to FILE")
@@ -89,6 +130,72 @@ def dim(s):    return f"\033[2m{s}\033[0m" if TTY else s
 def italic(s): return f"\033[3m{s}\033[0m" if TTY else s
 def bold(s):   return f"\033[1m{s}\033[0m" if TTY else s
 def red(s):    return f"\033[31m{s}\033[0m" if TTY else s
+def green(s):  return f"\033[32m{s}\033[0m" if TTY else s
+
+
+class Spinner:
+    FRAMES_BRAILLE = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    FRAMES_ASCII = ["|", "/", "-", "\\"]
+
+    def __init__(self, message="Waiting..."):
+        self.message = message
+        self.running = False
+        self.thread = None
+        self.tokens = 0
+        use_braille = True
+        try:
+            "⠋".encode(sys.stderr.encoding or "utf-8")
+        except Exception:
+            use_braille = False
+        self.frames = self.FRAMES_BRAILLE if use_braille else self.FRAMES_ASCII
+
+    def start(self):
+        if not TTY or self.running or os.environ.get("BORROW_TEST"):
+            return
+        self.running = True
+        try:
+            sys.stderr.write("\033[?25l")
+            sys.stderr.flush()
+        except Exception:
+            pass
+        self.thread = threading.Thread(target=self._spin, daemon=True)
+        self.thread.start()
+
+    def _spin(self):
+        idx = 0
+        while self.running:
+            frame = self.frames[idx % len(self.frames)]
+            idx += 1
+            tok_info = f" ({self.tokens} tokens)" if self.tokens > 0 else ""
+            try:
+                sys.stderr.write(f"\r\033[K{dim(frame)} {self.message}{dim(tok_info)}")
+                sys.stderr.flush()
+            except Exception:
+                break
+            time.sleep(0.08)
+
+    def update(self, message=None, tokens=None):
+        if message is not None:
+            self.message = message
+        if tokens is not None:
+            self.tokens = tokens
+
+    def stop(self, final_text=None):
+        if not self.running:
+            if final_text:
+                print(final_text)
+            return
+        self.running = False
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=0.3)
+        if TTY and not os.environ.get("BORROW_TEST"):
+            try:
+                sys.stderr.write("\r\033[K\033[?25h")
+                sys.stderr.flush()
+            except Exception:
+                pass
+        if final_text:
+            print(final_text)
 
 
 class UserError(Exception):
@@ -137,30 +244,43 @@ def health():
 
 
 # ----------------------------------------------------------------------------- model call
-def stream_chat(messages, temp, max_tokens):
+def stream_chat(messages, temp, max_tokens, top_p=0.8, top_k=20, repeat_penalty=1.05, silent=False, status_label=None):
     """Stream a reply to the terminal. Returns (text, finish_reason); finish_reason is "length" when the reply
     hit the token limit. Returns (None, None) on error. Text is partial if interrupted with Ctrl+C."""
     if not STATE["url"] or not STATE["key"]:
         print(red("Not connected. Type /connect <url> <key>, or set ASK_URL and ASK_KEY."))
         return None, None
-    body = json.dumps({"messages": messages, "max_tokens": max_tokens, "temperature": temp, "stream": True}).encode()
+    payload = {
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temp,
+        "top_p": top_p,
+        "top_k": top_k,
+        "repeat_penalty": repeat_penalty,
+        "stream": True,
+    }
+    body = json.dumps(payload).encode()
     req = urllib.request.Request(STATE["url"] + "/v1/chat/completions", data=body, headers={
         "Content-Type": "application/json", "Authorization": "Bearer " + STATE["key"], **UA})
     text, finish = "", None
     in_reasoning = False
+    tokens = 0
+    spinner = Spinner(status_label or "Waiting for response...")
+    spinner.start()
     try:
         with urllib.request.urlopen(req, timeout=600) as r:
-            print()
+            if not silent:
+                print()
             try:
                 for raw in r:
                     line = raw.decode("utf-8", "replace").strip()
                     if not line.startswith("data:"):
                         continue
-                    payload = line[5:].strip()
-                    if payload == "[DONE]":
+                    payload_str = line[5:].strip()
+                    if payload_str == "[DONE]":
                         break
                     try:
-                        chunk = json.loads(payload)
+                        chunk = json.loads(payload_str)
                     except json.JSONDecodeError:
                         continue
                     choices = chunk.get("choices")
@@ -173,30 +293,48 @@ def stream_chat(messages, temp, max_tokens):
                     finish = choice.get("finish_reason") or finish
 
                     if reasoning:
-                        if not in_reasoning:
-                            print(dim(italic("[thinking...] ")), end="", flush=True)
-                            in_reasoning = True
-                        print(dim(reasoning), end="", flush=True)
+                        tokens += 1
+                        if not silent:
+                            spinner.stop()
+                            if not in_reasoning:
+                                print(dim(italic("[thinking...] ")), end="", flush=True)
+                                in_reasoning = True
+                            print(dim(reasoning), end="", flush=True)
+                        else:
+                            spinner.update("Thinking...", tokens=tokens)
+
                     if content:
-                        if in_reasoning:
-                            print()  # end reasoning section
-                            in_reasoning = False
+                        tokens += 1
                         text += content
-                        print(content, end="", flush=True)
+                        if not silent:
+                            spinner.stop()
+                            if in_reasoning:
+                                print()  # end reasoning section
+                                in_reasoning = False
+                            print(content, end="", flush=True)
+                        else:
+                            lbl = status_label or "Generating..."
+                            spinner.update(lbl, tokens=tokens)
             except KeyboardInterrupt:
-                print(dim("\n[interrupted]"), end="")
-            print("\n")
+                spinner.stop(dim("\n[interrupted]"))
+                return text, finish
+            finally:
+                spinner.stop()
+            if not silent:
+                print("\n")
         return text, finish
     except urllib.error.HTTPError as e:
+        spinner.stop()
         print(red(f"HTTP {e.code}: {e.read().decode(errors='replace')[:300]}"))
     except Exception as e:
+        spinner.stop()
         print(red(f"Request failed (is the Kaggle session still running? try /status): {e}"))
     return None, None
 
 
-def trim_history():
+def trim_history(extra_chars=0):
     h = STATE["history"]
-    while len(h) > 2 and sum(len(m["content"]) for m in h) > MAX_HISTORY_CHARS:
+    while len(h) > 2 and (sum(len(m["content"]) for m in h) + extra_chars) > MAX_HISTORY_CHARS:
         del h[:2]
 
 
@@ -210,18 +348,22 @@ def merge_continuation(prev, more):
     return prev + more
 
 
-def ask(mode, content, temp=0.2, max_tokens=DEFAULT_MAX_TOKENS):
+def ask(mode, content, temp=0.2, max_tokens=DEFAULT_MAX_TOKENS, silent=False, status_label=None):
+    trim_history(extra_chars=len(content))
     system = BASE + (" " + MODES[mode] if mode else "")
     base = [{"role": "system", "content": system}] + STATE["history"] + [{"role": "user", "content": content}]
-    text, finish = stream_chat(base, temp, max_tokens)
+    text, finish = stream_chat(base, temp, max_tokens, silent=silent, status_label=status_label)
     if text is None:
         return None
     rounds = 0
     while finish == "length" and rounds < MAX_CONTINUES:
         rounds += 1
-        print(dim(f"[reached the {max_tokens}-token limit; asking the model to continue ({rounds}/{MAX_CONTINUES})]"))
+        cont_label = f"{status_label} (continuing {rounds}/{MAX_CONTINUES})" if status_label else "Continuing..."
+        if not silent:
+            print(dim(f"[reached the {max_tokens}-token limit; asking the model to continue ({rounds}/{MAX_CONTINUES})]"))
         more, finish = stream_chat(base + [{"role": "assistant", "content": text},
-                                           {"role": "user", "content": CONTINUE_PROMPT}], temp, max_tokens)
+                                           {"role": "user", "content": CONTINUE_PROMPT}],
+                                   temp, max_tokens, silent=silent, status_label=cont_label)
         if more is None:
             break
         text = merge_continuation(text, more)
@@ -332,7 +474,8 @@ def save_output(path, text, as_code):
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(data + "\n", encoding="utf-8")
-        print(dim(f"saved to {path}"))
+        line_count = len(data.splitlines())
+        print(f"{green('✔')} Saved to {bold(str(path))} {dim(f'({line_count} lines)')}")
     except OSError as e:
         raise UserError(f"Cannot save to {path}: {e}")
 
@@ -433,9 +576,18 @@ def cmd_generic(name, args):
     if needs in ("text_or_files", "text_or_files_or_run") and not (args["text"] or args["files"] or extra or STATE["piped"]):
         raise UserError(f"Nothing to work on. Usage: {spec['usage']}   (example: {spec['example']})")
     content = build_content(args, extra)
-    text = ask(spec["mode"], content, args["temp"], args["max_tokens"])
-    if text and args.get("out"):
-        save_output(args["out"], text, as_code=spec["mode"] in ("code", "test", "doc", "fix"))
+    out_file = args.get("out")
+    silent = bool(out_file)
+    status_label = f"Generating {out_file}..." if out_file else None
+    text = ask(spec["mode"], content, args["temp"], args["max_tokens"], silent=silent, status_label=status_label)
+    if text and out_file:
+        save_output(out_file, text, as_code=spec["mode"] in ("code", "test", "doc", "fix"))
+        if spec["mode"] == "fix":
+            m = re.search(r"```[A-Za-z0-9_+.-]*[ \t]*\r?\n", text)
+            if m and m.start() > 0:
+                explanation = text[:m.start()].strip()
+                if explanation:
+                    print(dim(explanation))
 
 
 def handle(line):
