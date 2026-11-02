@@ -122,15 +122,19 @@ again (the build and download repeat), then run `/connect` with the new values.
   the arrow keys or Tab to choose.
 - After a command, type **`-`** to see that command's flags.
 - Type **`@`** to attach files. Tab completes paths.
-- Type **plain text** to chat.
+- Type **plain text** or use **`/edit`** to ask the autonomous agent to inspect, edit, or test files in your current directory.
 - **Ctrl+C** stops a reply while it is being generated. **Ctrl+D** or `/exit` quits.
 - `/help` lists every command with its flags and what it does. `/help review` shows one command with an example.
 - `borrow --help` prints the same help from your normal shell, and `borrow --version` prints the version.
 
 ## Talking to the model
 
-**Chat.** Anything you type without a leading `/` is sent to the model as a chat message. Replies stream in as they
-are generated.
+**Autonomous Agent & Chat.** Anything you type without a leading `/` (or using `/edit`) engages the autonomous agent.
+Like Claude Code or `agy`, the agent can:
+- Explore your current workspace and read files on demand (`read_file`, `search_files`).
+- Propose and apply exact, in-place edits to your files (`edit_file`, `write_file`) with interactive colored unified diffs.
+- Run tests and shell commands (`run_command`) to verify its changes.
+- Every edit asks for confirmation `[Y/n/a(ll)]` before touching disk (or use `-y` / `/auto` to auto-approve).
 
 **Memory.** The conversation has memory, so follow-ups work: after `/review @app.py` you can simply type
 `fix the second issue` or `show me the corrected function`. Use `/clear` to start fresh. History is trimmed
@@ -146,6 +150,7 @@ For `/code`, `/test`, `/doc` and `/fix` it saves just the first code block.
 
 | Command | What it does | Flags |
 |---|---|---|
+| `/edit <instructions>` | Autonomous agent task: inspects, edits files, and runs commands | `-t TEMP` `-m N` |
 | `/code <what to build>` | Generates code only, no explanation | `-o FILE` `-t TEMP` `-m N` |
 | `/explain [@file ...] [question]` | Explains code or an error in plain language | `-o` `-t` `-m` |
 | `/review [@file ...] [focus]` | Strict code review, most important issues first | `-o` `-t` `-m` |
@@ -154,6 +159,9 @@ For `/code`, `/test`, `/doc` and `/fix` it saves just the first code block.
 | `/doc [@file ...]` | Adds docstrings and comments without changing behaviour | `-o` `-t` `-m` |
 | `/commit` | Writes a commit message from your git changes | `--staged` `-o` `-t` |
 | `/shell <what you want>` | Turns a request into one shell command, then asks before running it | `-t` |
+| `/diff` | Shows git diff of all workspace changes made so far | |
+| `/revert [file]` | Reverts uncommitted git changes in a file | |
+| `/auto` | Toggles auto-approving edits and commands without asking | |
 | `/clear` | Forgets the conversation so far | |
 | `/connect [<url> <key>]` | Sets or shows the endpoint (saved for next time) | |
 | `/status` | Checks that the server is reachable | |

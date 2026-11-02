@@ -8,10 +8,10 @@ Connect:       set ASK_URL / ASK_KEY (printed by the Kaggle script) or type  /co
 Inside the CLI type  /  to open the command menu, @ to attach files, plain text to chat.
 No flags to remember: type /help for every command, its flags and what it does.
 """
-import difflib, json, os, re, shlex, shutil, subprocess, sys, threading, time, urllib.error, urllib.request
+import difflib, json, os, re, secrets, shlex, shutil, subprocess, sys, threading, time, urllib.error, urllib.request
 from pathlib import Path
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 CONFIG_PATH = Path.home() / ".borrow.json"
 LEGACY_CONFIG_PATH = Path.home() / ".qwen_cli.json"   # older versions saved here
 HISTORY_PATH = Path.home() / ".borrow_history"
@@ -109,6 +109,15 @@ COMMANDS = {
     "shell":   dict(desc="Turn a request into one shell command, then ask before running it", usage="/shell <what you want>",
                     mode="shell", needs="text", flags=[F_TEMP],
                     example="/shell find files bigger than 100MB"),
+    "edit":    dict(desc="Ask the agent to edit files or perform tasks in your workspace",
+                    usage="/edit <instructions>", mode="edit", needs="text",
+                    flags=[F_TEMP, F_MAX], example="/edit fix the bug in utils.py"),
+    "auto":    dict(desc="Toggle auto-approving edits and commands without asking",
+                    usage="/auto", mode=None, needs=None, flags=[], example="/auto"),
+    "diff":    dict(desc="Show git diff of all workspace changes made so far",
+                    usage="/diff", mode=None, needs=None, flags=[], example="/diff"),
+    "revert":  dict(desc="Revert uncommitted git changes in a file (git checkout -- <file>)",
+                    usage="/revert [file]", mode=None, needs=None, flags=[], example="/revert borrow.py"),
     "clear":   dict(desc="Forget the conversation so far", usage="/clear", mode=None, needs=None, flags=[],
                     example="/clear"),
     "connect": dict(desc="Set or show the endpoint (saved for next time)", usage="/connect [<url> <key>]", mode=None,
@@ -122,7 +131,7 @@ COMMANDS = {
 FLAG_DEST = {"-o": ("out", True), "-t": ("temp", True), "-m": ("max_tokens", True),
              "--run": ("run", True), "--staged": ("staged", False)}
 
-STATE = {"url": "", "key": "", "history": [], "piped": ""}
+STATE = {"url": "", "key": "", "history": [], "piped": "", "auto_approve": False}
 TTY = sys.stdout.isatty()
 
 
@@ -131,6 +140,8 @@ def italic(s): return f"\033[3m{s}\033[0m" if TTY else s
 def bold(s):   return f"\033[1m{s}\033[0m" if TTY else s
 def red(s):    return f"\033[31m{s}\033[0m" if TTY else s
 def green(s):  return f"\033[32m{s}\033[0m" if TTY else s
+def cyan(s):   return f"\033[36m{s}\033[0m" if TTY else s
+def yellow(s): return f"\033[33m{s}\033[0m" if TTY else s
 
 
 class Spinner:
@@ -244,12 +255,12 @@ def health():
 
 
 # ----------------------------------------------------------------------------- model call
-def stream_chat(messages, temp, max_tokens, top_p=0.8, top_k=20, repeat_penalty=1.05, silent=False, status_label=None):
-    """Stream a reply to the terminal. Returns (text, finish_reason); finish_reason is "length" when the reply
-    hit the token limit. Returns (None, None) on error. Text is partial if interrupted with Ctrl+C."""
+def stream_chat(messages, temp, max_tokens, top_p=0.8, top_k=20, repeat_penalty=1.05, silent=False, status_label=None, tools=None):
+    """Stream a reply to the terminal. Returns (text, finish_reason) or (text, finish_reason, tool_calls) if tools is provided.
+    finish_reason is 'length' when token limit is reached, or 'tool_calls' when tools are invoked."""
     if not STATE["url"] or not STATE["key"]:
         print(red("Not connected. Type /connect <url> <key>, or set ASK_URL and ASK_KEY."))
-        return None, None
+        return (None, None, []) if tools is not None else (None, None)
     payload = {
         "messages": messages,
         "max_tokens": max_tokens,
@@ -259,10 +270,13 @@ def stream_chat(messages, temp, max_tokens, top_p=0.8, top_k=20, repeat_penalty=
         "repeat_penalty": repeat_penalty,
         "stream": True,
     }
+    if tools:
+        payload["tools"] = tools
     body = json.dumps(payload).encode()
     req = urllib.request.Request(STATE["url"] + "/v1/chat/completions", data=body, headers={
         "Content-Type": "application/json", "Authorization": "Bearer " + STATE["key"], **UA})
     text, finish = "", None
+    tool_calls_acc = []
     in_reasoning = False
     tokens = 0
     spinner = Spinner(status_label or "Waiting for response...")
@@ -292,6 +306,19 @@ def stream_chat(messages, temp, max_tokens, top_p=0.8, top_k=20, repeat_penalty=
                     content = delta.get("content") or ""
                     finish = choice.get("finish_reason") or finish
 
+                    if delta.get("tool_calls"):
+                        for tc in delta["tool_calls"]:
+                            idx = tc.get("index", 0)
+                            while len(tool_calls_acc) <= idx:
+                                tool_calls_acc.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                            if tc.get("id"):
+                                tool_calls_acc[idx]["id"] += tc["id"]
+                            fn = tc.get("function", {})
+                            if fn.get("name"):
+                                tool_calls_acc[idx]["function"]["name"] += fn["name"]
+                            if fn.get("arguments"):
+                                tool_calls_acc[idx]["function"]["arguments"] += fn["arguments"]
+
                     if reasoning:
                         tokens += 1
                         if not silent:
@@ -317,11 +344,15 @@ def stream_chat(messages, temp, max_tokens, top_p=0.8, top_k=20, repeat_penalty=
                             spinner.update(lbl, tokens=tokens)
             except KeyboardInterrupt:
                 spinner.stop(dim("\n[interrupted]"))
-                return text, finish
+                valid_tcs = [tc for tc in tool_calls_acc if tc["function"]["name"]]
+                return (text, finish, valid_tcs) if tools is not None else (text, finish)
             finally:
                 spinner.stop()
             if not silent:
                 print("\n")
+        valid_tcs = [tc for tc in tool_calls_acc if tc["function"]["name"]]
+        if tools is not None:
+            return text, finish, valid_tcs
         return text, finish
     except urllib.error.HTTPError as e:
         spinner.stop()
@@ -329,7 +360,7 @@ def stream_chat(messages, temp, max_tokens, top_p=0.8, top_k=20, repeat_penalty=
     except Exception as e:
         spinner.stop()
         print(red(f"Request failed (is the Kaggle session still running? try /status): {e}"))
-    return None, None
+    return (None, None, []) if tools is not None else (None, None)
 
 
 def trim_history(extra_chars=0):
@@ -385,6 +416,432 @@ def first_block(text):
     return rest[:closing.start()] if closing else rest
 
 
+def format_diff(old_text, new_text, path):
+    diff = list(difflib.unified_diff(
+        old_text.splitlines(keepends=True),
+        new_text.splitlines(keepends=True),
+        fromfile=f"a/{path}",
+        tofile=f"b/{path}",
+        n=3
+    ))
+    if not diff:
+        return "(no changes)"
+    out = []
+    for line in diff:
+        line_s = line.rstrip("\r\n")
+        if line.startswith("+++") or line.startswith("---"):
+            out.append(bold(line_s))
+        elif line.startswith("@@"):
+            out.append(cyan(line_s))
+        elif line.startswith("+"):
+            out.append(green(line_s))
+        elif line.startswith("-"):
+            out.append(red(line_s))
+        else:
+            out.append(" " + line_s if not line_s.startswith(" ") else line_s)
+    return "\n".join(out)
+
+
+def prompt_confirm(prompt_msg, default=True):
+    if STATE.get("auto_approve"):
+        return True
+    prompt_str = f"{bold(prompt_msg)} [Y/n/a(ll)] " if default else f"{bold(prompt_msg)} [y/N/a(ll)] "
+    try:
+        ans = input(prompt_str).strip().lower()
+        if not ans:
+            return default
+        if ans in ("a", "all"):
+            STATE["auto_approve"] = True
+            print(dim("(Auto-approve enabled for this session)"))
+            return True
+        return ans in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+
+# ----------------------------------------------------------------------------- agent tools
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read contents of a file in the workspace. Returns line-numbered text.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Relative or absolute file path to read"},
+                    "start_line": {"type": "integer", "description": "1-based start line (optional)"},
+                    "end_line": {"type": "integer", "description": "1-based end line (optional)"}
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Edit an existing file by replacing an exact string target with replacement. Displays a diff and requests user confirmation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to modify"},
+                    "target": {"type": "string", "description": "Exact text sequence to be replaced, including whitespace and indentation"},
+                    "replacement": {"type": "string", "description": "The replacement text"}
+                },
+                "required": ["path", "target", "replacement"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Create a new file or completely overwrite an existing file with the provided content.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to write"},
+                    "content": {"type": "string", "description": "Full file content"}
+                },
+                "required": ["path", "content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_directory",
+            "description": "List files and directories in a given workspace path.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory path to list (default: .)", "default": "."}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_files",
+            "description": "Search for a string or regex pattern across workspace files.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search term or regex pattern"},
+                    "path": {"type": "string", "description": "Directory to search within (default: .)", "default": "."}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": "Run a shell command in the workspace (e.g. pytest, git status, python) and return its output and exit code.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Shell command line to execute"}
+                },
+                "required": ["command"]
+            }
+        }
+    }
+]
+
+
+def tool_read_file(path, start_line=1, end_line=None):
+    p = Path(path).expanduser()
+    if p.is_dir():
+        return f"Error: {path} is a directory, not a file. Use list_directory instead."
+    if not p.is_file():
+        return f"Error: File not found: {path}"
+    try:
+        with p.open("rb") as f:
+            chunk = f.read(4096)
+            if b"\x00" in chunk:
+                return f"Error: {path} is a binary file; cannot read."
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as e:
+        return f"Error reading {path}: {e}"
+
+    total_lines = len(lines)
+    start = max(1, start_line or 1)
+    end = min(total_lines, end_line or total_lines)
+    if start > total_lines:
+        return f"File {path} only has {total_lines} lines (requested start line {start})."
+
+    if end - start + 1 > 400:
+        end = start + 399
+        note = f"\n[truncated: showing lines {start}-{end} of {total_lines}. Use start_line={end+1} to read further]"
+    else:
+        note = f"\n[lines {start}-{end} of {total_lines}]"
+
+    formatted = [f"{i:4d} | {lines[i-1]}" for i in range(start, end + 1)]
+    return f"File: {path}\n" + "\n".join(formatted) + note
+
+
+def tool_edit_file(path, target, replacement, auto_approve=False):
+    p = Path(path).expanduser()
+    if not p.is_file():
+        return f"Error: File not found: {path}"
+    try:
+        content = p.read_text(encoding="utf-8")
+    except OSError as e:
+        return f"Error reading {path}: {e}"
+
+    c_norm = content.replace("\r\n", "\n")
+    t_norm = target.replace("\r\n", "\n")
+    r_norm = replacement.replace("\r\n", "\n")
+
+    count = c_norm.count(t_norm)
+    if count == 0:
+        return f"Error: target string not found in {path}. Make sure whitespace and indentation match exactly."
+    if count > 1:
+        return f"Error: target string occurs {count} times in {path}. Provide more surrounding context lines so the target is unique."
+
+    new_content = c_norm.replace(t_norm, r_norm, 1)
+    if "\r\n" in content:
+        new_content = new_content.replace("\n", "\r\n")
+
+    diff_text = format_diff(content, new_content, path)
+    print("\n" + bold(f"Proposed edit for {path}:"))
+    print("─" * 60)
+    print(diff_text)
+    print("─" * 60)
+
+    if not auto_approve and not STATE.get("auto_approve"):
+        if not prompt_confirm(f"Apply changes to {path}?"):
+            return f"User declined the changes to {path}."
+
+    try:
+        tmp_path = p.with_suffix(p.suffix + ".borrow_tmp")
+        tmp_path.write_text(new_content, encoding="utf-8")
+        tmp_path.replace(p)
+        print(green(f"✔ Successfully edited {path}"))
+        return f"Successfully updated {path}."
+    except OSError as e:
+        return f"Error writing to {path}: {e}"
+
+
+def tool_write_file(path, content, auto_approve=False):
+    p = Path(path).expanduser()
+    if p.is_dir():
+        return f"Error: {path} is a directory, not a file."
+
+    exists = p.is_file()
+    lines_count = len(content.splitlines())
+    action_label = f"Overwrite {path}" if exists else f"Create {path}"
+
+    if exists:
+        try:
+            old_text = p.read_text(encoding="utf-8", errors="replace")
+            print("\n" + bold(f"Proposed overwrite for {path}:"))
+            print("─" * 60)
+            print(format_diff(old_text, content, path))
+            print("─" * 60)
+        except OSError:
+            pass
+
+    if not auto_approve and not STATE.get("auto_approve"):
+        if not prompt_confirm(f"{action_label} ({lines_count} lines)?"):
+            return f"User declined to write {path}."
+
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = p.with_suffix(p.suffix + ".borrow_tmp")
+        tmp_path.write_text(content, encoding="utf-8")
+        tmp_path.replace(p)
+        print(green(f"✔ {action_label} ({lines_count} lines)"))
+        return f"Successfully wrote {path} ({lines_count} lines)."
+    except OSError as e:
+        return f"Error writing {path}: {e}"
+
+
+def tool_list_directory(path="."):
+    p = Path(path).expanduser()
+    if not p.is_dir():
+        return f"Error: Directory not found: {path}"
+    ignored = {".git", "__pycache__", ".venv", ".pytest_cache", "node_modules", "build", "dist", ".qa-venv"}
+    try:
+        entries = sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+    except OSError as e:
+        return f"Error listing {path}: {e}"
+
+    results = []
+    for e in entries:
+        if e.name in ignored:
+            continue
+        if e.is_dir():
+            results.append(f"  [dir]  {e.name}/")
+        else:
+            try:
+                size = e.stat().st_size
+                results.append(f"  {size:>8} B  {e.name}")
+            except OSError:
+                results.append(f"  {e.name}")
+    return f"Directory {path}:\n" + ("\n".join(results) if results else "  (empty)")
+
+
+def tool_search_files(query, path="."):
+    p = Path(path).expanduser()
+    if not p.is_dir():
+        return f"Error: {path} is not a directory"
+    ignored = {".git", "__pycache__", ".venv", ".pytest_cache", "node_modules", "build", "dist", ".qa-venv"}
+    try:
+        regex = re.compile(query, re.IGNORECASE)
+    except re.error as e:
+        return f"Invalid regex pattern '{query}': {e}"
+
+    matches = []
+    cwd = Path.cwd()
+    for root, dirs, files in os.walk(p):
+        dirs[:] = [d for d in dirs if d not in ignored]
+        for f in sorted(files):
+            file_path = Path(root) / f
+            try:
+                with file_path.open("rb") as fp:
+                    if b"\x00" in fp.read(1024):
+                        continue
+                with file_path.open("r", encoding="utf-8", errors="ignore") as fp:
+                    for lnum, line in enumerate(fp, 1):
+                        if regex.search(line):
+                            try:
+                                rel = file_path.relative_to(cwd)
+                            except ValueError:
+                                rel = file_path
+                            matches.append(f"{rel}:{lnum}: {line.strip()[:150]}")
+                            if len(matches) >= 50:
+                                return "Search results (capped at 50):\n" + "\n".join(matches)
+            except OSError:
+                continue
+    return "Search results:\n" + ("\n".join(matches) if matches else "No matches found.")
+
+
+def tool_run_command(command, auto_approve=False):
+    print(bold("Command requested: ") + command)
+    if not auto_approve and not STATE.get("auto_approve"):
+        if not prompt_confirm(f"Execute `{command}`?"):
+            return f"User declined to run command: {command}"
+    print(dim(f"Running: {command}..."))
+    try:
+        r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=120)
+        out = (r.stdout + r.stderr).strip()
+        truncated = out[-4000:] if len(out) > 4000 else out
+        return f"Command: {command}\nExit code: {r.returncode}\nOutput:\n{truncated}"
+    except subprocess.TimeoutExpired:
+        return f"Command `{command}` timed out after 120 seconds."
+    except Exception as e:
+        return f"Execution error: {e}"
+
+
+def execute_tool(name, args, auto_approve=False):
+    if name == "read_file":
+        return tool_read_file(args.get("path", ""), args.get("start_line", 1), args.get("end_line"))
+    elif name == "edit_file":
+        return tool_edit_file(args.get("path", ""), args.get("target", ""), args.get("replacement", ""), auto_approve)
+    elif name == "write_file":
+        return tool_write_file(args.get("path", ""), args.get("content", ""), auto_approve)
+    elif name == "list_directory":
+        return tool_list_directory(args.get("path", "."))
+    elif name == "search_files":
+        return tool_search_files(args.get("query", ""), args.get("path", "."))
+    elif name == "run_command":
+        return tool_run_command(args.get("command", ""), auto_approve)
+    return f"Unknown tool: {name}"
+
+
+def get_workspace_summary(max_files=60):
+    ignored = {".git", "__pycache__", ".venv", ".pytest_cache", "node_modules", "build", "dist", ".qa-venv"}
+    files_list = []
+    root = Path.cwd()
+    for p in root.rglob("*"):
+        if any(part in ignored for part in p.parts):
+            continue
+        if p.is_file():
+            try:
+                rel = p.relative_to(root)
+                files_list.append(str(rel))
+                if len(files_list) >= max_files:
+                    break
+            except ValueError:
+                pass
+    if not files_list:
+        return "(empty or outside repository)"
+    return "\n".join(f"- {f}" for f in sorted(files_list))
+
+
+def run_agent(prompt, auto_approve=False, max_turns=12):
+    """Autonomous agent loop supporting tool calling, file reading, editing, and commands."""
+    ws_tree = get_workspace_summary()
+    system_prompt = (
+        BASE + "\n\n"
+        "You are an autonomous pair-programming agent running in the user's terminal workspace (like Claude Code or agy).\n"
+        "You have tools to inspect files, make direct in-place edits, write new files, search, and run commands.\n"
+        "Workflows:\n"
+        "1. When the user asks to modify, inspect, or fix code, first read the file with `read_file` or search with `search_files`.\n"
+        "2. To modify existing code, use `edit_file` with the exact target text and replacement.\n"
+        "3. Only use `write_file` for new files or complete rewrites.\n"
+        "4. When appropriate, run tests or verify your work with `run_command`.\n"
+        "5. Explain concisely what you did when done.\n\n"
+        f"Workspace Directory: {Path.cwd()}\n"
+        f"Workspace Files:\n{ws_tree}\n"
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        *STATE["history"],
+        {"role": "user", "content": prompt}
+    ]
+
+    turns = 0
+    final_text = ""
+    while turns < max_turns:
+        turns += 1
+        res = stream_chat(messages, temp=0.2, max_tokens=DEFAULT_MAX_TOKENS, tools=TOOLS)
+        text, finish, tool_calls = res[0], res[1], res[2] if len(res) > 2 else []
+
+        if text:
+            final_text += text
+
+        if not tool_calls:
+            # Model finished without calling any tools
+            break
+
+        # Record assistant tool call turn
+        messages.append({
+            "role": "assistant",
+            "content": text or "",
+            "tool_calls": tool_calls
+        })
+
+        for tc in tool_calls:
+            fn = tc.get("function", {})
+            fn_name = fn.get("name", "")
+            raw_args = fn.get("arguments", "{}")
+            call_id = tc.get("id") or f"call_{secrets.token_hex(4)}"
+            try:
+                args = json.loads(raw_args)
+            except Exception:
+                args = {}
+
+            print(dim(f"⚡ [tool] {fn_name}({', '.join(f'{k}={repr(v)[:50]}' for k, v in args.items())})"))
+            result = execute_tool(fn_name, args, auto_approve=auto_approve)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": str(result)
+            })
+
+    if final_text:
+        STATE["history"].append({"role": "user", "content": prompt})
+        STATE["history"].append({"role": "assistant", "content": final_text})
+        trim_history()
+    return final_text
+
+
 # ----------------------------------------------------------------------------- parsing
 def split_line(rest):
     try:
@@ -427,6 +884,10 @@ def parse_args(name, rest):
         out["max_tokens"] = int(out.get("max_tokens", DEFAULT_MAX_TOKENS))
     except ValueError:
         raise UserError("-t must be a number like 0.2 and -m a whole number like 8192")
+    if out["temp"] < 0:
+        raise UserError("-t (temperature) must be 0.0 or greater")
+    if out["max_tokens"] < 1:
+        raise UserError("-m (max tokens) must be a positive integer (at least 1)")
     out["text"] = " ".join(out["text"])
     return out
 
@@ -438,6 +899,10 @@ def read_file_block(path):
     if not p.is_file():
         raise UserError(f"File not found: {path}")
     try:
+        with p.open("rb") as f:
+            chunk = f.read(4096)
+            if b"\x00" in chunk:
+                raise UserError(f"Cannot attach binary file: {path}")
         data = p.read_text(encoding="utf-8", errors="replace")
     except OSError as e:
         raise UserError(f"Cannot read {path}: {e}")
@@ -471,6 +936,8 @@ def build_content(args, extra=()):
 def save_output(path, text, as_code):
     data = first_block(text).strip("\n") if as_code and "```" in text else text.strip()
     p = Path(path).expanduser()
+    if p.is_dir():
+        raise UserError(f"Cannot save to {path}: it is a directory, not a file.")
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(data + "\n", encoding="utf-8")
@@ -590,7 +1057,34 @@ def cmd_generic(name, args):
                     print(dim(explanation))
 
 
-def handle(line):
+def cmd_diff():
+    if not shutil.which("git"):
+        raise UserError("git is not installed.")
+    code, out = run_capture("git diff")
+    if not out.strip():
+        print(dim("No unstaged git changes."))
+        return
+    for l in out.splitlines():
+        if l.startswith("+"):
+            print(green(l))
+        elif l.startswith("-"):
+            print(red(l))
+        elif l.startswith("@@"):
+            print(cyan(l))
+        else:
+            print(l)
+
+
+def cmd_revert(rest):
+    target = rest.strip() if rest else "."
+    if not shutil.which("git"):
+        raise UserError("git is not installed.")
+    if prompt_confirm(f"Revert git changes in {target}?"):
+        code, out = run_capture(f"git checkout -- {shlex.quote(target)}")
+        print(green(f"✔ Reverted {target}") if code == 0 else red(f"Revert failed: {out}"))
+
+
+def handle(line, raise_errors=False):
     """Run one input line. Returns False when the user wants to quit."""
     line = line.strip()
     if not line:
@@ -613,13 +1107,26 @@ def handle(line):
                 cmd_connect(rest)
             elif name == "status":
                 cmd_status(rest)
+            elif name == "auto":
+                STATE["auto_approve"] = not STATE.get("auto_approve", False)
+                status = green("ENABLED (no confirmation prompts)") if STATE["auto_approve"] else dim("DISABLED (will ask confirmation)")
+                print(f"Auto-approval {status}")
+            elif name == "diff":
+                cmd_diff()
+            elif name == "revert":
+                cmd_revert(rest)
+            elif name == "edit":
+                args = parse_args(name, rest)
+                run_agent(args["text"], auto_approve=STATE.get("auto_approve"))
             else:
                 args = parse_args(name, rest)
                 cmd_shell(args) if name == "shell" else cmd_generic(name, args)
         else:
             args = parse_args_chat(line)
-            ask(None, build_content(args), args["temp"], args["max_tokens"])
+            run_agent(build_content(args), auto_approve=STATE.get("auto_approve"))
     except UserError as e:
+        if raise_errors:
+            raise
         print(red(str(e)))
     return True
 
@@ -757,12 +1264,19 @@ def main():
         print_help()
         return
     load_config()
+    if "-y" in args or "--yes" in args:
+        STATE["auto_approve"] = True
+        args = [a for a in args if a not in ("-y", "--yes")]
     if args:                                    # one-shot mode
         if "-" in args:                         # a lone "-" means: read piped input from stdin
             args = [a for a in args if a != "-"]
             STATE["piped"] = sys.stdin.read()
         line = subprocess.list2cmdline(args) if os.name == "nt" else " ".join(shlex.quote(a) for a in args)
-        handle(line)
+        try:
+            handle(line, raise_errors=True)
+        except UserError as e:
+            print(red(str(e)))
+            sys.exit(1)
         return
     repl(get_session())
 
@@ -772,6 +1286,8 @@ def run():
         main()
     except BrokenPipeError:                     # e.g. output piped into `head`
         pass
+    except SystemExit:
+        raise
 
 
 if __name__ == "__main__":

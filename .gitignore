@@ -1,8 +1,73 @@
-.venv/
-borrow.egg-info/
-build/
-dist/
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.qa-venv/
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+htmlcov/
+.hypothesis/
+.tox/
+.nox/
+
+# QA test run reports, skills & agent testing kit
+qa_reports/
+qa-kit/
+.agents
+AGENTS.md
+qa
+tests/regressions/
+
+# Local credentials, history & runtime state
 .borrow.json
 .borrow_history
+.qwen_cli.json
+*.borrow_tmp
+*.log
+
+# Scratch / sample files
+landing_page*.html
+
+# IDEs & OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
