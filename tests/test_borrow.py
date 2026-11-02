@@ -106,6 +106,10 @@ class TestCodeExtractionAndContinuation(unittest.TestCase):
         text = "Here is code:\n```python\nprint('hello')\n```\nExplanation."
         self.assertEqual(borrow.first_block(text), "print('hello')\n")
 
+    def test_first_block_with_explanation_before(self):
+        text = "Root cause:\n1. Off by one error\n\n```python\ndef fixed():\n    return 42\n```"
+        self.assertEqual(borrow.first_block(text), "def fixed():\n    return 42\n")
+
     def test_first_block_windows_crlf(self):
         text = "Here is code:\r\n```python\r\nprint('hello')\r\n```\r\nExplanation."
         self.assertEqual(borrow.first_block(text), "print('hello')\r\n")
@@ -175,7 +179,36 @@ class TestConfigAndPermissions(unittest.TestCase):
             self.assertEqual(borrow.STATE["key"], "test-secret-key")
 
 
+class TestHistoryTrimming(unittest.TestCase):
+    def setUp(self):
+        borrow.STATE["history"] = []
+
+    def test_trim_history_exceeding_budget(self):
+        borrow.STATE["history"] = [
+            {"role": "user", "content": "a" * 40_000},
+            {"role": "assistant", "content": "b" * 40_000},
+            {"role": "user", "content": "c" * 100},
+            {"role": "assistant", "content": "d" * 100},
+        ]
+        borrow.trim_history()
+        self.assertEqual(len(borrow.STATE["history"]), 2)
+        self.assertEqual(borrow.STATE["history"][0]["content"], "c" * 100)
+
+    def test_trim_history_with_extra_chars(self):
+        borrow.STATE["history"] = [
+            {"role": "user", "content": "a" * 30_000},
+            {"role": "assistant", "content": "b" * 30_000},
+            {"role": "user", "content": "c" * 100},
+            {"role": "assistant", "content": "d" * 100},
+        ]
+        borrow.trim_history(extra_chars=20_000)
+        self.assertEqual(len(borrow.STATE["history"]), 2)
+        self.assertEqual(borrow.STATE["history"][0]["content"], "c" * 100)
+
+
 class MockServerHandler(http.server.BaseHTTPRequestHandler):
+    last_request_body = None
+
     def log_message(self, format, *args):
         pass  # Suppress logging in tests
 
@@ -193,6 +226,7 @@ class MockServerHandler(http.server.BaseHTTPRequestHandler):
         if self.path == "/v1/chat/completions":
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length))
+            MockServerHandler.last_request_body = body
             messages = body.get("messages", [])
 
             self.send_response(200)
@@ -232,6 +266,7 @@ class MockServerHandler(http.server.BaseHTTPRequestHandler):
 class TestMockServerStreaming(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        os.environ["BORROW_TEST"] = "1"
         cls.server = http.server.HTTPServer(("127.0.0.1", 0), MockServerHandler)
         cls.port = cls.server.server_port
         cls.thread = threading.Thread(target=cls.server.serve_forever)
@@ -240,6 +275,7 @@ class TestMockServerStreaming(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        os.environ.pop("BORROW_TEST", None)
         cls.server.shutdown()
         cls.server.server_close()
 
@@ -257,6 +293,25 @@ class TestMockServerStreaming(unittest.TestCase):
         self.assertIn("def first_part():", reply)
         self.assertIn("return 100", reply)
         self.assertEqual(len(borrow.STATE["history"]), 2)
+
+    def test_stream_chat_sampling_parameters(self):
+        borrow.ask("code", "test params")
+        body = MockServerHandler.last_request_body
+        self.assertIsNotNone(body)
+        self.assertEqual(body.get("temperature"), 0.2)
+        self.assertEqual(body.get("top_p"), 0.8)
+        self.assertEqual(body.get("top_k"), 20)
+        self.assertEqual(body.get("repeat_penalty"), 1.05)
+
+    def test_cmd_generic_with_out_silent(self):
+        with tempfile.TemporaryDirectory() as td:
+            out_file = Path(td) / "generated.py"
+            args = borrow.parse_args("code", f"write something -o {out_file}")
+            borrow.cmd_generic("code", args)
+            self.assertTrue(out_file.is_file())
+            content = out_file.read_text(encoding="utf-8")
+            self.assertIn("def first_part():", content)
+            self.assertIn("return 100", content)
 
 
 if __name__ == "__main__":
