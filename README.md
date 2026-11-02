@@ -35,7 +35,7 @@ No GPU of your own and no paid services needed.
 
 | File | Runs on | Purpose |
 |---|---|---|
-| `serve_qwen_kaggle.py` | Kaggle notebook | Builds llama.cpp with CUDA, downloads the model, starts the server, opens the tunnel and prints your connection details |
+| `qwen_serv.py` | Kaggle notebook | Builds llama.cpp with CUDA, downloads the model, starts the server, opens the tunnel and prints your connection details |
 | `borrow.py` + `pyproject.toml` | Your computer | The `borrow` command: `/` command menu, `@file` attachments, streaming replies and chat memory |
 
 Observed in one real run on 2x Tesla T4: about **58-68 tokens/second** with the 30B coder model
@@ -60,9 +60,11 @@ Observed in one real run on 2x Tesla T4: about **58-68 tokens/second** with the 
 ### 1. Start the model on Kaggle
 
 1. Create a new Kaggle notebook and set the accelerator and Internet as described above.
-2. Paste the **entire** contents of `serve_qwen_kaggle.py` into **one code cell** and run it.
-3. The first run takes roughly **15-25 minutes**: about 10-15 minutes to compile llama.cpp, then a ~19 GB model
-   download. You will see progress as `[1/6] ... [6/6]`.
+2. Paste the **entire** contents of `qwen_serv.py` into **one code cell** and run it.
+3. The script automatically fetches prebuilt CUDA-accelerated `llama-server` binaries and enables
+   multi-stream downloads (`hf-transfer`), dropping initial setup from ~30 minutes down to **~3–5 minutes**.
+   *(Tip: If you mount the GGUF model as a Kaggle Dataset in `/kaggle/input`, setup finishes in **~1–2 minutes** with 0s download time).*
+   You will see progress as `[1/6] ... [6/6]`.
 4. When it finishes, the output ends with a ready-to-paste line like:
 
    ```
@@ -237,21 +239,22 @@ git diff | borrow /review -      # a lone "-" means: read piped input
 ## Choosing a model
 
 By default the Kaggle script picks a model from your total GPU memory. Edit the settings at the top of
-`serve_qwen_kaggle.py`:
+`qwen_serv.py`:
 
 ```python
-MODEL_CHOICE = "auto"   # "auto" | "coder30b" | "qwen35_27b" | "qwen35_9b"
-THINKING     = False    # Qwen3.5 models only: True = better reasoning, much slower
+MODEL_CHOICE = "auto"   # "auto" | "coder32b_dense" | "coder30b" | "coder14b_dense" | "qwen35_27b" | "qwen35_9b"
+THINKING     = True     # Enable reasoning/thinking when supported by the model (better accuracy)
 ```
 
 | Preset | Model | Context | Needs (total VRAM) | Notes |
 |---|---|---|---|---|
-| `coder30b` | Qwen3-Coder-30B-A3B-Instruct, Q4_K_M (~18.6 GB) | 32768 | about 26 GB | Default with 2x T4. Coding-specific and fast |
-| `qwen35_27b` | Qwen3.5-27B, Q4_K_M | 16384 | about 24 GB | General model, dense, slower |
-| `qwen35_9b` | Qwen3.5-9B, Q4_K_M | 16384 | about 10 GB | Fallback when only one GPU is available |
+| `coder32b_dense` | Qwen2.5-Coder-32B-Instruct, Q4_K_M (~19.8 GB) | 32768 | about 26 GB | **Highest accuracy**: dense 32B model, superior coding reasoning and bug detection. Slower (~12-18 tok/s). |
+| `coder30b` | Qwen3-Coder-30B-A3B-Instruct, Q4_K_M (~18.6 GB) | 32768 | about 26 GB | **Fast MoE**: 3.3B active parameters per token (~58-68 tok/s). Great for speed, lighter on deep logic. |
+| `coder14b_dense` | Qwen2.5-Coder-14B-Instruct, Q4_K_M (~9.0 GB) | 32768 | about 12 GB | Strong dense reasoning, fits even on a single GPU session (~25-35 tok/s). |
+| `qwen35_27b` | Qwen3.5-27B, Q4_K_M | 16384 | about 24 GB | General model with native thinking capability. |
+| `qwen35_9b` | Qwen3.5-9B, Q4_K_M | 16384 | about 10 GB | Fallback when only one GPU is available. |
 
-`auto` chooses `coder30b` when at least 26 GB of VRAM is visible, otherwise `qwen35_9b`. Other GGUF repos work if
-you add a preset with the repo name and quantization. The model is exposed under the name `qwen`.
+`auto` chooses `coder30b` when at least 26 GB of VRAM is visible, otherwise `coder14b_dense` or `qwen35_9b`. If you prioritize **accuracy over speed**, change `MODEL_CHOICE = "coder32b_dense"`.
 
 ## Limits and honest expectations
 
