@@ -17,15 +17,20 @@ import glob, json, os, re, secrets, shutil, socket, subprocess, time
 import requests
 
 # ----------------------------- settings you may edit -----------------------------
-MODEL_CHOICE = "auto"   # "auto" | "coder30b" | "qwen35_27b" | "qwen35_9b"
-THINKING     = False    # Qwen3.5 only: True = better reasoning but much slower
+MODEL_CHOICE = "auto"   # "auto" | "coder32b_dense" | "coder30b" | "coder14b_dense" | "qwen35_27b" | "qwen35_9b"
+THINKING     = True     # Enable reasoning/thinking when supported by the model (better accuracy)
 PORT         = 8080
 UA           = {"User-Agent": "curl/8.5.0"}   # Cloudflare can reject python's default user agent
 
 PRESETS = {   # min_vram_gb = total VRAM across all visible GPUs needed for this preset
-    "coder30b":   dict(repo="unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF", quant="Q4_K_M", ctx=32768, min_vram_gb=26),
-    "qwen35_27b": dict(repo="unsloth/Qwen3.5-27B-GGUF",                  quant="Q4_K_M", ctx=16384, min_vram_gb=24),
-    "qwen35_9b":  dict(repo="unsloth/Qwen3.5-9B-GGUF",                   quant="Q4_K_M", ctx=16384, min_vram_gb=10),
+    # Dense coder models: highest accuracy and code reasoning depth
+    "coder32b_dense": dict(repo="unsloth/Qwen2.5-Coder-32B-Instruct-GGUF", quant="Q4_K_M", ctx=32768, min_vram_gb=26),
+    "coder14b_dense": dict(repo="unsloth/Qwen2.5-Coder-14B-Instruct-GGUF", quant="Q4_K_M", ctx=32768, min_vram_gb=12),
+    # MoE coder model: fast token generation (3.3B active parameters per token)
+    "coder30b":       dict(repo="unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF", quant="Q4_K_M", ctx=32768, min_vram_gb=26),
+    # General-purpose Qwen3.5 models (with thinking support)
+    "qwen35_27b":     dict(repo="unsloth/Qwen3.5-27B-GGUF",                  quant="Q4_K_M", ctx=16384, min_vram_gb=24),
+    "qwen35_9b":      dict(repo="unsloth/Qwen3.5-9B-GGUF",                   quant="Q4_K_M", ctx=16384, min_vram_gb=10),
 }
 # ---------------------------------------------------------------------------------
 
@@ -108,7 +113,7 @@ def pick_workdir(need_gb=35):
 def choose_preset(total_vram):
     if MODEL_CHOICE != "auto":
         return MODEL_CHOICE, PRESETS[MODEL_CHOICE]
-    for key in ("coder30b", "qwen35_9b"):
+    for key in ("coder30b", "coder14b_dense", "qwen35_9b"):
         if total_vram >= PRESETS[key]["min_vram_gb"]:
             return key, PRESETS[key]
     raise RuntimeError(f"Only {total_vram:.0f} GB VRAM visible; need at least 10 GB.")
@@ -143,8 +148,66 @@ def find_libcuda():
     return (real or stubs or [None])[0]
 
 
+def try_download_prebuilt_llama():
+    """Attempt to fetch an official prebuilt CUDA-enabled llama-server binary from GitHub releases.
+    Saves 10-15 minutes of compilation time."""
+    global SERVER_BIN
+    try:
+        url = "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=5"
+        req = requests.get(url, headers=UA, timeout=10)
+        if req.status_code != 200:
+            return False
+        releases = req.json()
+        asset_url = None
+        for rel in releases:
+            for a in rel.get("assets", []):
+                name = a["name"].lower()
+                if "ubuntu" in name and "cuda" in name and "x64" in name and name.endswith(".tar.gz") and not name.startswith("cudart-"):
+                    asset_url = a["browser_download_url"]
+                    break
+            if asset_url:
+                break
+        if not asset_url:
+            return False
+
+        print(f"  Downloading prebuilt llama-server ({asset_url.split('/')[-1]})...")
+        tar_path = f"{WORK}/llama_prebuilt.tar.gz"
+        sh(f"wget -q -O {tar_path} '{asset_url}'")
+        sh(f"tar -xzf {tar_path} -C {WORK}/")
+
+        # Find the extracted llama-server executable
+        for root, _, files in os.walk(WORK):
+            if "llama-server" in files:
+                cand = os.path.join(root, "llama-server")
+                os.chmod(cand, 0o755)
+                # Verify that it runs and links against system libraries
+                env = dict(os.environ)
+                env["LD_LIBRARY_PATH"] = root + ":" + env.get("LD_LIBRARY_PATH", "")
+                r = subprocess.run([cand, "--version"], capture_output=True, text=True, env=env)
+                if r.returncode == 0:
+                    SERVER_BIN = cand
+                    print(f"  Prebuilt llama-server verified: {SERVER_BIN}")
+                    return True
+    except Exception as e:
+        print(f"  Prebuilt binary attempt skipped ({e}), falling back to compilation.")
+    return False
+
+
+def setup_llama_cpp(arch):
+    global SERVER_BIN
+    if SERVER_BIN and os.path.exists(SERVER_BIN):
+        print("llama-server already available, skipping.")
+        return
+    print("Checking for prebuilt CUDA-accelerated llama-server (fast setup)...")
+    if try_download_prebuilt_llama():
+        return
+    print("Compiling llama.cpp from source (fallback)...")
+    build_llama_cpp(arch)
+
+
 def build_llama_cpp(arch):
-    if os.path.exists(SERVER_BIN):
+    global SERVER_BIN
+    if SERVER_BIN and os.path.exists(SERVER_BIN):
         print("llama-server already built, skipping.")
         return
     nvcc = find_nvcc()
@@ -186,12 +249,31 @@ def build_llama_cpp(arch):
     print(f"Compiling with {jobs} jobs (about 10-15 min, this is normal)...")
     sh(f"cmake --build build --config Release -j{jobs} --target llama-server",
        cwd=src, log=f"{WORK}/cmake_build.log", show_progress=True)
+    SERVER_BIN = f"{src}/build/bin/llama-server"
     if not os.path.exists(SERVER_BIN):
         raise RuntimeError(f"Build finished but {SERVER_BIN} is missing. See {WORK}/cmake_build.log")
     print("Built:", SERVER_BIN)
 
 
 def download_model(repo, quant):
+    # 1. First check if model is already available on disk (e.g. attached as a Kaggle Dataset)
+    for input_dir in ("/kaggle/input", "/kaggle/working"):
+        if os.path.isdir(input_dir):
+            for root, _, files in os.walk(input_dir):
+                for f in files:
+                    if f.lower().endswith(".gguf") and quant.lower() in f.lower() and "mmproj" not in f.lower():
+                        found = os.path.join(root, f)
+                        size_gb = os.path.getsize(found) / 1e9
+                        print(f"Using pre-mounted model from dataset: {found} ({size_gb:.1f} GB) [0s wait!]")
+                        return found
+
+    # 2. Enable ultra-fast multi-threaded download via hf-transfer
+    try:
+        import hf_transfer
+    except ImportError:
+        sh("pip install -q hf-transfer")
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+
     try:
         from huggingface_hub import list_repo_files, hf_hub_download
     except ImportError:
@@ -202,7 +284,7 @@ def download_model(repo, quant):
     matches = sorted([f for f in files if quant.lower() in f.lower()], key=len)
     if not matches:
         raise RuntimeError(f"No '{quant}' file in {repo}. Files available:\n" + "\n".join(files))
-    print(f"Downloading {len(matches)} file(s) from {repo} (large, be patient)...")
+    print(f"Downloading {len(matches)} file(s) from {repo} (accelerated with hf-transfer)...")
     paths = [hf_hub_download(repo, f, local_dir=f"{WORK}/models") for f in matches]
     first = next((p for p in paths if "00001-of" in p), paths[0])   # split models: point at shard 1
     total = sum(os.path.getsize(p) for p in paths) / 1e9
@@ -231,6 +313,7 @@ def start_server(model_path, ctx, repo):
     if "Qwen3.5" in repo and not THINKING:      # Qwen3-Coder has no thinking mode, so no flag needed
         cmd += ["--chat-template-kwargs", json.dumps({"enable_thinking": False})]
     env = dict(os.environ)
+    env["LLAMA_ARG_FLASH_ATTN"] = "on"
     env["LD_LIBRARY_PATH"] = os.path.dirname(SERVER_BIN) + ":" + env.get("LD_LIBRARY_PATH", "")
     SERVER_PROC = subprocess.Popen(cmd, stdout=open(log_path, "w"), stderr=subprocess.STDOUT,
                                    env=env, cwd=os.path.dirname(SERVER_BIN))
@@ -257,7 +340,8 @@ def test_chat(base, prompt="Write a Python one-liner that reverses a string."):
     r = requests.post(base + "/v1/chat/completions",
                       headers={"Authorization": f"Bearer {API_KEY}", **UA},
                       json={"messages": [{"role": "user", "content": prompt}],
-                            "max_tokens": 200, "temperature": 0.2}, timeout=300)
+                            "max_tokens": 200, "temperature": 0.2,
+                            "top_p": 0.8, "top_k": 20}, timeout=300)
     r.raise_for_status()
     j = r.json()
     print(j["choices"][0]["message"]["content"])
@@ -345,8 +429,8 @@ def main():
     key, preset = choose_preset(total_vram)
     print(f"Model preset: {key} -> {preset['repo']} ({preset['quant']}), context {preset['ctx']}")
 
-    print("[2/6] Building llama.cpp")
-    build_llama_cpp(arch)
+    print("[2/6] Setting up llama.cpp")
+    setup_llama_cpp(arch)
     print("[3/6] Downloading model")
     model_path = download_model(preset["repo"], preset["quant"])
     print("[4/6] Starting server")
