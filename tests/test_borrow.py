@@ -294,6 +294,14 @@ class TestMockServerStreaming(unittest.TestCase):
         self.assertIn("return 100", reply)
         self.assertEqual(len(borrow.STATE["history"]), 2)
 
+    def test_reasoning_is_kept_for_think_and_model_name_is_cleaned(self):
+        borrow.ask("code", "write a function")
+        self.assertEqual(borrow.STATE["thought"], "Analyzing...")
+        self.assertGreater(borrow.STATE["ctx_used"], 0)
+        self.assertEqual(borrow.pretty_model("/tmp/m/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"),
+                         "Qwen3-Coder-30B-A3B-Instruct")
+        self.assertEqual(borrow.pretty_model("qwen"), "qwen")
+
     def test_stream_chat_sampling_parameters(self):
         borrow.ask("code", "test params")
         body = MockServerHandler.last_request_body
@@ -312,6 +320,79 @@ class TestMockServerStreaming(unittest.TestCase):
             content = out_file.read_text(encoding="utf-8")
             self.assertIn("def first_part():", content)
             self.assertIn("return 100", content)
+
+
+class TestCompact(unittest.TestCase):
+    def setUp(self):
+        self.saved = dict(borrow.STATE)
+        borrow.STATE["history"] = [{"role": r, "content": f"{r} {i}"} for i in range(4) for r in ("user", "assistant")]
+
+    def tearDown(self):
+        borrow.STATE.clear()
+        borrow.STATE.update(self.saved)
+
+    def test_compact_keeps_last_exchange_and_summarizes_the_rest(self):
+        seen = {}
+        def fake(messages, **kw):
+            seen["prompt"] = messages[-1]["content"]
+            return "- user wants X", "stop"
+        with patch.object(borrow, "stream_chat", side_effect=fake):
+            self.assertTrue(borrow.compact(focus="the auth bug"))
+        h = borrow.STATE["history"]
+        self.assertEqual(len(h), 4)
+        self.assertIn("- user wants X", h[0]["content"])
+        self.assertEqual([m["content"] for m in h[2:]], ["user 3", "assistant 3"])
+        self.assertIn("user 0", seen["prompt"])
+        self.assertNotIn("user 3", seen["prompt"])
+        self.assertIn("the auth bug", seen["prompt"])
+
+    def test_failed_compact_leaves_history_alone(self):
+        before = list(borrow.STATE["history"])
+        with patch.object(borrow, "stream_chat", return_value=(None, None)):
+            self.assertFalse(borrow.compact())
+        self.assertEqual(borrow.STATE["history"], before)
+
+    def test_auto_compact_only_when_context_is_nearly_full(self):
+        borrow.STATE.update(n_ctx=32768, ctx_used=10000)
+        with patch.object(borrow, "compact") as c:
+            borrow.maybe_compact()
+            c.assert_not_called()
+            borrow.STATE["ctx_used"] = 27000                  # 82%
+            borrow.maybe_compact()
+            c.assert_called_once()
+            borrow.STATE["history"] = borrow.STATE["history"][:4]   # just compacted: don't loop
+            borrow.maybe_compact()
+            c.assert_called_once()
+
+
+class TestPromptLook(unittest.TestCase):
+    def test_input_fragments_colours_command_flags_and_files(self):
+        styles = dict((t, s) for s, t in borrow.input_fragments("/review @app.py -o out.txt"))
+        self.assertEqual(styles["/review"], "class:cmd")
+        self.assertEqual(styles["@app.py"], "class:file")
+        self.assertEqual(styles["-o"], "class:flag")
+        self.assertEqual(borrow.input_fragments("/con")[0][0], "class:cmd")       # half-typed is fine
+        self.assertEqual(borrow.input_fragments("/nope")[0][0], "class:cmd-bad")
+        self.assertEqual(borrow.input_fragments("/review", first=False)[0][0], "")  # only line 1 is a command
+        self.assertEqual("".join(t for _, t in borrow.input_fragments("a  b @c")), "a  b @c")
+
+    def test_caret_blinks_but_stays_solid_while_typing(self):
+        self.assertTrue(borrow.caret_on(100.0, typed_at=100.0))     # just typed: visible
+        self.assertFalse(borrow.caret_on(100.6, typed_at=100.0))    # first off phase
+        self.assertTrue(borrow.caret_on(101.1, typed_at=100.0))     # back on
+
+    def test_ctx_meter(self):
+        self.assertEqual(borrow.ctx_meter(0, 100), "─" * 10)
+        self.assertEqual(borrow.ctx_meter(50, 100), "━" * 5 + "─" * 5)
+        self.assertEqual(borrow.ctx_meter(500, 100), "━" * 10)
+
+    def test_spinner_rotates_thinking_words(self):
+        s = borrow.Spinner("Thinking · step 2…")
+        seen = set()
+        for k in range(4):
+            s.t0 = borrow.time.time() - k * 2.5 - 0.1
+            seen.add(next(w for w in s.words if w in s.render(0)))
+        self.assertGreater(len(seen), 1)
 
 
 if __name__ == "__main__":

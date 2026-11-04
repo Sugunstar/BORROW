@@ -8,7 +8,8 @@ Connect:       set ASK_URL / ASK_KEY (printed by the Kaggle script) or type  /co
 Inside the CLI type  /  to open the command menu, @ to attach files, plain text to chat.
 No flags to remember: type /help for every command, its flags and what it does.
 """
-import difflib, json, os, re, secrets, shlex, shutil, subprocess, sys, threading, time, urllib.error, urllib.request
+import difflib, json, math, os, random, re, secrets, shlex, shutil, subprocess, sys, textwrap, threading, time
+import urllib.error, urllib.request
 from pathlib import Path
 
 __version__ = "0.1.3"
@@ -23,6 +24,12 @@ CONTINUE_PROMPT = ("Your previous reply was cut off. Continue exactly where it s
                    "text, starting mid-line if needed. Do not repeat anything already written, do not restart, "
                    "and do not add commentary.")
 MAX_HISTORY_CHARS = 70_000  # keeps the conversation inside the 32K-token context window
+COMPACT_AT = 0.80           # auto-compact once the context window is this full
+COMPACT_SYSTEM = (
+    "You compress a coding conversation so it can continue in a fresh context window. Write a dense summary "
+    "that keeps: the user's goals and requests, decisions made, files and functions touched (exact paths and "
+    "names), code that still matters (verbatim if short), errors seen and how they were fixed, and anything "
+    "unfinished. Drop greetings, repetition and dead ends. Use short bullet points. Output only the summary.")
 
 BASE = (
     "You are an expert senior software engineer and technical architect. "
@@ -118,6 +125,11 @@ COMMANDS = {
                     usage="/diff", mode=None, needs=None, flags=[], example="/diff"),
     "revert":  dict(desc="Revert uncommitted git changes in a file (git checkout -- <file>)",
                     usage="/revert [file]", mode=None, needs=None, flags=[], example="/revert borrow.py"),
+    "think":   dict(desc="Show the model's full reasoning for the last reply", usage="/think", mode=None,
+                    needs=None, flags=[], example="/think"),
+    "compact": dict(desc="Summarize the conversation to free up context (also runs automatically at 80%)",
+                    usage="/compact [what to focus on]", mode=None, needs=None, flags=[],
+                    example="/compact keep the details of the auth bug"),
     "clear":   dict(desc="Forget the conversation so far", usage="/clear", mode=None, needs=None, flags=[],
                     example="/clear"),
     "connect": dict(desc="Set or show the endpoint (saved for next time)", usage="/connect [<url> <key>]", mode=None,
@@ -131,7 +143,12 @@ COMMANDS = {
 FLAG_DEST = {"-o": ("out", True), "-t": ("temp", True), "-m": ("max_tokens", True),
              "--run": ("run", True), "--staged": ("staged", False)}
 
-STATE = {"url": "", "key": "", "history": [], "piped": "", "auto_approve": False}
+STATE = {"url": "", "key": "", "history": [], "piped": "", "auto_approve": False,
+         "online": None, "model": "", "n_ctx": 0, "ctx_used": 0, "tps": 0, "thought": "",
+         "tok_in": 0, "tok_out": 0}
+THINK_WORDS = ["Pondering", "Brewing", "Noodling", "Cogitating", "Mulling", "Percolating", "Untangling",
+               "Conjuring", "Tinkering", "Ruminating", "Hatching", "Wrangling", "Simmering", "Scheming",
+               "Musing", "Unraveling", "Distilling", "Deliberating", "Marinating", "Spelunking"]
 TTY = sys.stdout.isatty()
 
 
@@ -140,30 +157,59 @@ def italic(s): return f"\033[3m{s}\033[0m" if TTY else s
 def bold(s):   return f"\033[1m{s}\033[0m" if TTY else s
 def red(s):    return f"\033[31m{s}\033[0m" if TTY else s
 def green(s):  return f"\033[32m{s}\033[0m" if TTY else s
-def cyan(s):   return f"\033[36m{s}\033[0m" if TTY else s
-def yellow(s): return f"\033[33m{s}\033[0m" if TTY else s
+def yellow(s): return f"\033[38;5;220m{s}\033[0m" if TTY else s   # the BORROW yellow
+def gold(s):   return f"\033[38;5;178m{s}\033[0m" if TTY else s   # muted yellow for secondary info
+
+
+def shimmer(text, tick):
+    """Gold text with a bright highlight sweeping across it, one step per tick."""
+    if not TTY:
+        return text
+    head = tick % (len(text) + 8) - 4
+    return "".join(f"\033[38;5;{230 if i == head else 222 if abs(i - head) < 3 else 178}m{ch}"
+                   for i, ch in enumerate(text)) + "\033[0m"
+
+
+def fmt_secs(s):
+    return f"{s:.1f}s" if s < 60 else f"{int(s // 60)}m {int(s % 60):02d}s"
+
+
+def fmt_k(n):
+    """Token counts the way people say them: 512, 4.9K, 32K."""
+    if n < 1024:
+        return str(n)
+    return f"{n / 1024:.1f}K" if n < 10 * 1024 else f"{round(n / 1024)}K"
+
+
+def ctx_meter(used, n, width=10):
+    """━━━─────── how full the context window is."""
+    filled = min(width, round(used * width / n)) if n else 0
+    return "━" * filled + "─" * (width - filled)
+
+
+def mode_label():
+    return "Auto" if STATE.get("auto_approve") else "Agent"
 
 
 class Spinner:
+    """One live status line on stderr: spinner, shimmering label, elapsed time, tokens and a peek at the model's thoughts."""
     FRAMES_BRAILLE = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
     FRAMES_ASCII = ["|", "/", "-", "\\"]
 
-    def __init__(self, message="Waiting..."):
-        self.message = message
-        self.running = False
-        self.thread = None
-        self.tokens = 0
-        use_braille = True
+    def __init__(self, message="Working…"):
+        self.message, self.detail, self.tokens = message, "", 0
+        self.running, self.thread, self.t0 = False, None, time.time()
+        self.words = ["Thinking"] + random.sample(THINK_WORDS, len(THINK_WORDS))   # "Thinking" rotates through these
         try:
-            "⠋".encode(sys.stderr.encoding or "utf-8")
+            "⠋…".encode(sys.stderr.encoding or "utf-8")
+            self.frames = self.FRAMES_BRAILLE
         except Exception:
-            use_braille = False
-        self.frames = self.FRAMES_BRAILLE if use_braille else self.FRAMES_ASCII
+            self.frames = self.FRAMES_ASCII
 
     def start(self):
         if not TTY or self.running or os.environ.get("BORROW_TEST"):
             return
-        self.running = True
+        self.running, self.t0 = True, time.time()
         try:
             sys.stderr.write("\033[?25l")
             sys.stderr.flush()
@@ -172,24 +218,36 @@ class Spinner:
         self.thread = threading.Thread(target=self._spin, daemon=True)
         self.thread.start()
 
+    def render(self, tick):
+        cols = shutil.get_terminal_size((80, 20)).columns - 1
+        meta = " " + fmt_secs(time.time() - self.t0) + (f" · {self.tokens} tokens" if self.tokens else "")
+        word = self.words[int((time.time() - self.t0) / 2.5) % len(self.words)]
+        label = self.message.replace("Thinking", word, 1)[:max(8, cols - len(meta) - 3)]
+        room = cols - len(label) - len(meta) - 6
+        peek = " ".join(self.detail.split()) if room > 12 else ""
+        if len(peek) > room:                    # keep the newest words, starting on a word boundary
+            peek = "…" + peek[-room + 1:].partition(" ")[2]
+        return (f"\r\033[K{yellow(self.frames[tick % len(self.frames)])} {shimmer(label, tick)}{dim(meta)}"
+                + (f"  {dim(italic(peek))}" if peek else ""))
+
     def _spin(self):
-        idx = 0
+        tick = 0
         while self.running:
-            frame = self.frames[idx % len(self.frames)]
-            idx += 1
-            tok_info = f" ({self.tokens} tokens)" if self.tokens > 0 else ""
             try:
-                sys.stderr.write(f"\r\033[K{dim(frame)} {self.message}{dim(tok_info)}")
+                sys.stderr.write(self.render(tick))
                 sys.stderr.flush()
             except Exception:
                 break
+            tick += 1
             time.sleep(0.08)
 
-    def update(self, message=None, tokens=None):
+    def update(self, message=None, tokens=None, detail=None):
         if message is not None:
             self.message = message
         if tokens is not None:
             self.tokens = tokens
+        if detail is not None:
+            self.detail = detail
 
     def stop(self, final_text=None):
         if not self.running:
@@ -254,6 +312,35 @@ def health():
         return False
 
 
+def pretty_model(name):
+    """'/models/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf' -> 'Qwen3-Coder-30B-A3B-Instruct'."""
+    name = re.sub(r"\.gguf$", "", re.split(r"[\\/]", name)[-1], flags=re.I)
+    name = re.sub(r"-\d{5}-of-\d{5}$", "", name)
+    return re.sub(r"[-_.](UD-)?(I?Q\d\w*|BF16|F16|F32)$", "", name, flags=re.I) or name
+
+
+def fetch_server_info():
+    """Fill STATE with reachability, model name and context size. Runs in a background thread at startup."""
+    STATE.update(online=None, model="", n_ctx=0)
+    STATE["online"] = health()
+    if not STATE["online"]:
+        return
+    headers = {"Authorization": "Bearer " + STATE["key"], **UA}
+    for path in ("/props", "/v1/models"):     # /props is llama-server's own; /v1/models is the OpenAI-style fallback
+        try:
+            with urllib.request.urlopen(urllib.request.Request(STATE["url"] + path, headers=headers), timeout=10) as r:
+                data = json.loads(r.read().decode("utf-8", "replace"))
+            if path == "/props":
+                STATE["n_ctx"] = (data.get("default_generation_settings") or {}).get("n_ctx") or data.get("n_ctx") or 0
+                name = data.get("model_path") or ""
+            else:
+                name = (data.get("data") or [{}])[0].get("id") or ""
+            if name and not STATE["model"]:
+                STATE["model"] = pretty_model(name)
+        except Exception:
+            continue
+
+
 # ----------------------------------------------------------------------------- model call
 def stream_chat(messages, temp, max_tokens, top_p=0.8, top_k=20, repeat_penalty=1.05, silent=False, status_label=None, tools=None):
     """Stream a reply to the terminal. Returns (text, finish_reason) or (text, finish_reason, tool_calls) if tools is provided.
@@ -269,23 +356,32 @@ def stream_chat(messages, temp, max_tokens, top_p=0.8, top_k=20, repeat_penalty=
         "top_k": top_k,
         "repeat_penalty": repeat_penalty,
         "stream": True,
+        "stream_options": {"include_usage": True},   # lets us show how full the context window is
     }
     if tools:
         payload["tools"] = tools
     body = json.dumps(payload).encode()
     req = urllib.request.Request(STATE["url"] + "/v1/chat/completions", data=body, headers={
         "Content-Type": "application/json", "Authorization": "Bearer " + STATE["key"], **UA})
-    text, finish = "", None
+    text, finish, thought = "", None, ""
     tool_calls_acc = []
-    in_reasoning = False
     in_tool_call = False
-    tokens = 0
-    spinner = Spinner(status_label or "Waiting for response...")
+    tokens = think_tokens = 0
+    t_start, t_think, usage, timings = time.time(), None, None, None
+    spinner = Spinner(status_label or "Thinking…")
+
+    def close_thought():
+        """Collapse a finished reasoning phase into one summary line (/think shows the full text)."""
+        nonlocal t_think
+        if t_think is None:
+            return
+        spinner.stop(None if silent else
+                     gold("◇ ") + dim(f"Thought for {fmt_secs(time.time() - t_think)} · {think_tokens} tokens"))
+        t_think = None
+
     spinner.start()
     try:
         with urllib.request.urlopen(req, timeout=600) as r:
-            if not silent:
-                print()
             try:
                 for raw in r:
                     line = raw.decode("utf-8", "replace").strip()
@@ -298,14 +394,31 @@ def stream_chat(messages, temp, max_tokens, top_p=0.8, top_k=20, repeat_penalty=
                         chunk = json.loads(payload_str)
                     except json.JSONDecodeError:
                         continue
+                    usage = chunk.get("usage") or usage
+                    timings = chunk.get("timings") or timings
                     choices = chunk.get("choices")
                     if not choices:
                         continue
                     choice = choices[0]
-                    delta = choice.get("delta", {})
+                    delta = choice.get("delta") or {}
                     reasoning = delta.get("reasoning_content") or ""
                     content = delta.get("content") or ""
                     finish = choice.get("finish_reason") or finish
+
+                    if reasoning:
+                        if t_think is None:              # a new thinking phase starts
+                            t_think, think_tokens = time.time(), 0
+                            if STATE["thought"] and not STATE["thought"].endswith("\n"):
+                                STATE["thought"] += "\n\n"
+                        tokens += 1
+                        think_tokens += 1
+                        thought += reasoning
+                        STATE["thought"] += reasoning
+                        spinner.update(tokens=tokens, detail=thought[-400:])
+                        spinner.start()
+
+                    if content or delta.get("tool_calls"):
+                        close_thought()
 
                     if delta.get("tool_calls"):
                         for tc in delta["tool_calls"]:
@@ -327,50 +440,34 @@ def stream_chat(messages, temp, max_tokens, top_p=0.8, top_k=20, repeat_penalty=
                                 sys.stdout.write("\n")
                                 sys.stdout.flush()
 
-                        fn_name = ""
-                        for tc in tool_calls_acc:
-                            if tc.get("function", {}).get("name"):
-                                fn_name = tc["function"]["name"]
-                                break
-                        lbl = f"Preparing {cyan(fn_name)}..." if fn_name else "Preparing tool action..."
-                        if not spinner.running:
-                            spinner.message = lbl
-                            spinner.tokens = tokens
-                            spinner.start()
-                        else:
-                            spinner.update(lbl, tokens=tokens)
-
-                    if reasoning:
-                        tokens += 1
-                        if not silent:
-                            spinner.stop()
-                            if not in_reasoning:
-                                print(dim(italic("[thinking...] ")), end="", flush=True)
-                                in_reasoning = True
-                            print(dim(reasoning), end="", flush=True)
-                        else:
-                            spinner.update("Thinking...", tokens=tokens)
+                        fn_name = next((tc["function"]["name"] for tc in tool_calls_acc if tc["function"]["name"]), "")
+                        spinner.update(f"Preparing {fn_name}…" if fn_name else "Preparing tool call…",
+                                       tokens=tokens, detail="")
+                        spinner.start()
 
                     if content:
                         tokens += 1
                         text += content
-                        if not silent:
-                            spinner.stop()
-                            if in_reasoning:
-                                print()  # end reasoning section
-                                in_reasoning = False
-                            print(content, end="", flush=True)
+                        if silent:
+                            spinner.update(tokens=tokens)
                         else:
-                            lbl = status_label or "Generating..."
-                            spinner.update(lbl, tokens=tokens)
+                            spinner.stop()
+                            print(content, end="", flush=True)
             except KeyboardInterrupt:
                 spinner.stop(dim("\n[interrupted]"))
                 valid_tcs = [tc for tc in tool_calls_acc if tc["function"]["name"]]
                 return (text, finish, valid_tcs) if tools is not None else (text, finish)
             finally:
                 spinner.stop()
-            if not silent and not in_tool_call:
-                print("\n")
+            close_thought()                     # the stream ended while the model was still thinking
+            if not silent and text and not in_tool_call and not text.endswith("\n"):
+                print()
+        STATE["tok_in"] = (usage or {}).get("prompt_tokens") or 0
+        STATE["tok_out"] += (usage or {}).get("completion_tokens") or tokens   # summed over agent steps
+        STATE["ctx_used"] = (usage or {}).get("total_tokens") or (
+            sum(len(str(m.get("content") or "")) for m in messages) // 4 + tokens)   # rough guess without usage
+        secs = time.time() - t_start
+        STATE["tps"] = (timings or {}).get("predicted_per_second") or (tokens / secs if secs > 0 else 0)
         valid_tcs = [tc for tc in tool_calls_acc if tc["function"]["name"]]
         if tools is not None:
             return text, finish, valid_tcs
@@ -390,6 +487,43 @@ def trim_history(extra_chars=0):
         del h[:2]
 
 
+def compact(focus="", reason=""):
+    """Replace the conversation with a model-written summary, keeping the latest exchange word for word.
+    Returns True when the history was compacted."""
+    h = STATE["history"]
+    if not h:
+        print(dim("Nothing to compact yet."))
+        return False
+    old, keep = (h[:-2], h[-2:]) if len(h) > 2 else (h, [])
+    before = STATE.get("ctx_used") or sum(len(m["content"]) for m in h) // 4
+    transcript = "\n\n".join(f"{m['role'].upper()}:\n{m['content']}" for m in old)[-MAX_HISTORY_CHARS:]
+    ask_for = "Summarize this conversation." + (f" Pay special attention to: {focus}" if focus else "")
+    res = stream_chat([{"role": "system", "content": COMPACT_SYSTEM},
+                       {"role": "user", "content": f"{transcript}\n\n---\n{ask_for}"}],
+                      temp=0.2, max_tokens=2048, silent=True, status_label="Compacting conversation…")
+    summary = (res[0] or "").strip()
+    if not summary:
+        print(red("Compaction failed; the conversation was left as it was."))
+        return False
+    STATE["history"] = [{"role": "user", "content": "Summary of our conversation so far:\n" + summary},
+                        {"role": "assistant", "content": "Understood. I'll continue from this summary."}] + keep
+    STATE["ctx_used"] = sum(len(m["content"]) for m in STATE["history"]) // 4    # rough until the next reply
+    print(gold("◇ ") + dim(f"Compacted {len(old)} messages into a summary{reason} · "
+                           f"~{fmt_k(before)} → ~{fmt_k(STATE['ctx_used'])} tokens"))
+    return True
+
+
+def maybe_compact(extra_chars=0):
+    """Auto-compact before a call when the context window (or our character budget) is nearly full."""
+    n, used = STATE.get("n_ctx") or 0, STATE.get("ctx_used") or 0
+    chars = sum(len(m["content"]) for m in STATE["history"]) + extra_chars
+    # > 4 messages: right after compacting there are 4 (summary pair + last exchange); don't re-summarize those
+    if len(STATE["history"]) > 4 and ((n and used >= n * COMPACT_AT) or chars > MAX_HISTORY_CHARS):
+        pct = f" ({used * 100 // n}% of context used)" if n and used else ""
+        compact(reason=pct)
+    trim_history(extra_chars)            # safety net if compaction failed or the summary is still too big
+
+
 def merge_continuation(prev, more):
     """Join a continuation onto the earlier text. If we were inside an unclosed code block and the model
     reopened it with a fence such as ```html or ```, drop that repeated fence."""
@@ -400,8 +534,28 @@ def merge_continuation(prev, more):
     return prev + more
 
 
+def print_footer(t0, label):
+    """Dim one-line summary under each reply:
+    ◆ Agent · Qwen3-Coder-30B · 4.2s · 61 tok/s · 3.1K in / 412 out · ━━──────── 3.5K/32K context (11%)"""
+    if not TTY:
+        return
+    tin, tout = STATE.get("tok_in"), STATE.get("tok_out")
+    bits = [label, STATE.get("model"), fmt_secs(time.time() - t0),
+            f"{STATE['tps']:.0f} tok/s" if STATE.get("tps") else "",
+            (f"{fmt_k(tin)} in / " if tin else "") + (f"{fmt_k(tout)} out" if tout else "")]
+    line = yellow("◆ ") + dim(" · ".join(b for b in bits if b))
+    n, used = STATE.get("n_ctx") or 0, STATE.get("ctx_used") or 0
+    if n and used:
+        pct = used * 100 // n
+        meter = f"{ctx_meter(used, n)} {fmt_k(used)}/{fmt_k(n)} context ({pct}%)"
+        line += dim(" · ") + (red(meter) if pct >= 80 else gold(meter))
+    print("\n" + line)
+
+
 def ask(mode, content, temp=0.2, max_tokens=DEFAULT_MAX_TOKENS, silent=False, status_label=None):
-    trim_history(extra_chars=len(content))
+    maybe_compact(extra_chars=len(content))
+    t0 = time.time()
+    STATE.update(thought="", tok_in=0, tok_out=0)
     system = BASE + (" " + MODES[mode] if mode else "")
     base = [{"role": "system", "content": system}] + STATE["history"] + [{"role": "user", "content": content}]
     text, finish = stream_chat(base, temp, max_tokens, silent=silent, status_label=status_label)
@@ -422,6 +576,8 @@ def ask(mode, content, temp=0.2, max_tokens=DEFAULT_MAX_TOKENS, silent=False, st
     if finish == "length":
         print(red("Still cut off. Raise the limit with -m 16384, or ask for one part at a time "
                   "(for example: the HTML first, then the CSS)."))
+    if not silent:
+        print_footer(t0, (mode or "chat").capitalize())
     STATE["history"] += [{"role": "user", "content": content}, {"role": "assistant", "content": text}]
     trim_history()
     return text
@@ -453,7 +609,7 @@ def format_diff(old_text, new_text, path):
         if line.startswith("+++") or line.startswith("---"):
             out.append(bold(line_s))
         elif line.startswith("@@"):
-            out.append(cyan(line_s))
+            out.append(gold(line_s))
         elif line.startswith("+"):
             out.append(green(line_s))
         elif line.startswith("-"):
@@ -466,7 +622,7 @@ def format_diff(old_text, new_text, path):
 def prompt_confirm(prompt_msg, default=True):
     if STATE.get("auto_approve"):
         return True
-    prompt_str = f"{bold(prompt_msg)} [Y/n/a(ll)] " if default else f"{bold(prompt_msg)} [y/N/a(ll)] "
+    prompt_str = f"{yellow('?')} {bold(prompt_msg)} " + dim("[Y/n/a(ll)] " if default else "[y/N/a(ll)] ")
     try:
         ans = input(prompt_str).strip().lower()
         if not ans:
@@ -572,6 +728,10 @@ TOOLS = [
         }
     }
 ]
+
+
+TOOL_VERBS = {"read_file": ("Read", "path"), "edit_file": ("Edit", "path"), "write_file": ("Write", "path"),
+              "list_directory": ("List", "path"), "search_files": ("Search", "query"), "run_command": ("Run", "command")}
 
 
 def tool_read_file(path, start_line=1, end_line=None):
@@ -748,7 +908,6 @@ def tool_search_files(query, path="."):
 
 
 def tool_run_command(command, auto_approve=False):
-    print(bold("Command requested: ") + command)
     if not auto_approve and not STATE.get("auto_approve"):
         if not prompt_confirm(f"Execute `{command}`?"):
             return f"User declined to run command: {command}"
@@ -815,6 +974,7 @@ def is_pure_greeting(text):
 
 def run_agent(prompt, auto_approve=False, max_turns=12):
     """Autonomous agent loop supporting tool calling, file reading, editing, and commands."""
+    maybe_compact(extra_chars=len(prompt))
     ws_tree = get_workspace_summary()
     system_prompt = (
         BASE + "\n\n"
@@ -841,12 +1001,15 @@ def run_agent(prompt, auto_approve=False, max_turns=12):
 
     turns = 0
     final_text = ""
+    t0, failed = time.time(), False
+    STATE.update(thought="", tok_in=0, tok_out=0)
     use_tools = None if is_pure_greeting(prompt) else TOOLS
     while turns < max_turns:
         turns += 1
-        step_lbl = f"Thinking (step {turns}/{max_turns})..." if turns > 1 else "Thinking..."
+        step_lbl = f"Thinking · step {turns}…" if turns > 1 else "Thinking…"
         res = stream_chat(messages, temp=0.2, max_tokens=DEFAULT_MAX_TOKENS, tools=use_tools, status_label=step_lbl)
         text, finish, tool_calls = res[0], res[1], res[2] if len(res) > 2 else []
+        failed = text is None                   # the error is already printed
         use_tools = TOOLS
 
         if text:
@@ -872,8 +1035,12 @@ def run_agent(prompt, auto_approve=False, max_turns=12):
                 args = json.loads(raw_args)
             except Exception:
                 args = {}
+            if not isinstance(args, dict):
+                args = {}
 
-            print(dim(f"⚡ [tool] {fn_name}({', '.join(f'{k}={repr(v)[:50]}' for k, v in args.items())})"))
+            verb, key = TOOL_VERBS.get(fn_name, (fn_name, None))
+            arg = str(args.get(key, "")) if key else ", ".join(f"{k}={v!r}" for k, v in args.items())
+            print(yellow("● ") + bold(verb) + " " + dim((arg.splitlines() or [""])[0][:100]))
             result = execute_tool(fn_name, args, auto_approve=auto_approve)
             messages.append({
                 "role": "tool",
@@ -885,6 +1052,8 @@ def run_agent(prompt, auto_approve=False, max_turns=12):
         STATE["history"].append({"role": "user", "content": prompt})
         STATE["history"].append({"role": "assistant", "content": final_text})
         trim_history()
+    if not failed:
+        print_footer(t0, mode_label())
     return final_text
 
 
@@ -997,7 +1166,7 @@ def save_output(path, text, as_code):
 def print_help(only=None):
     names = [only] if only else list(COMMANDS)
     if not only:
-        print(bold("Commands") + dim("   (type / to open the menu, Tab or arrows to choose)\n"))
+        print(yellow(bold("Commands")) + dim("   (type / to open the menu, Tab or arrows to choose)\n"))
     for n in names:
         c = COMMANDS[n]
         print(f"  {bold(c['usage'])}")
@@ -1008,10 +1177,11 @@ def print_help(only=None):
             print(f"\n      example: {c['example']}")
         print()
     if not only:
-        print(bold("Tips"))
+        print(yellow(bold("Tips")))
         print("  @path        attach a file to any command or chat message (Tab completes paths)")
         print("  plain text   chat with memory; follow-ups can refer to earlier answers or reviews")
-        print("  Ctrl+C       stop a reply while it is generating   |   Ctrl+D or /exit  quit")
+        print("  Shift+Tab    toggle auto-approve   |   Ctrl+J or Alt+Enter  new line in the prompt")
+        print("  Ctrl+C       stop a reply, or clear the prompt (twice on an empty prompt quits)   |   Ctrl+D or /exit  quit")
         print("  One-shot from your shell:  borrow /review @app.py")
         print("  Pipe input in with a lone -:  git diff | borrow /review -\n")
 
@@ -1033,15 +1203,30 @@ def cmd_connect(rest):
         raise UserError("Usage: /connect <url> <key>")
     STATE["url"], STATE["key"] = toks[0].rstrip("/"), toks[1]
     STATE["history"].clear()
+    STATE["ctx_used"] = 0
     save_config()
-    print("saved. " + ("server reachable." if health() else red("saved, but the server did not answer /health yet.")))
+    fetch_server_info()
+    print("saved. " + ("server reachable." if STATE["online"] else red("saved, but the server did not answer /health yet.")))
 
 
 def cmd_status(rest):
     if not STATE["url"]:
         raise UserError("Not connected. Use /connect <url> <key>")
-    print(f"{STATE['url']}  ->  " + ("reachable" if health() else red("NOT reachable (session ended or URL changed?)")))
+    fetch_server_info()
+    print(f"{STATE['url']}  ->  " + ("reachable" if STATE["online"] else red("NOT reachable (session ended or URL changed?)")))
+    if STATE["model"]:
+        print(dim(f"model: {STATE['model']}" + (f" · {fmt_k(STATE['n_ctx'])} context" if STATE["n_ctx"] else "")))
     print(dim(f"conversation: {len(STATE['history']) // 2} exchanges in memory"))
+
+
+def cmd_think():
+    thought = STATE.get("thought", "").strip()
+    if not thought:
+        print(dim("No reasoning recorded for the last reply (this model may not think out loud)."))
+        return
+    print(gold("◇ Reasoning behind the last reply"))
+    for line in thought.splitlines():
+        print(gold("│ ") + dim(line))
 
 
 def cmd_shell(args):
@@ -1116,7 +1301,7 @@ def cmd_diff():
         elif l.startswith("-"):
             print(red(l))
         elif l.startswith("@@"):
-            print(cyan(l))
+            print(gold(l))
         else:
             print(l)
 
@@ -1146,9 +1331,14 @@ def handle(line, raise_errors=False):
                 return False
             if name == "help":
                 cmd_help(rest)
+            elif name == "compact":
+                compact(focus=rest.strip())
             elif name == "clear":
                 STATE["history"].clear()
+                STATE.update(ctx_used=0, thought="", show_splash=True)
                 print(dim("conversation cleared"))
+            elif name == "think":
+                cmd_think()
             elif name == "connect":
                 cmd_connect(rest)
             elif name == "status":
@@ -1234,39 +1424,319 @@ def make_completer():
     return SlashCompleter()
 
 
-def build_session(inp=None, out=None):
-    from prompt_toolkit import PromptSession
+def input_fragments(line, first=True):
+    """Colour one prompt line as you type: /command, -flags and @files each get their own style."""
+    is_cmd = first and line.startswith("/")
+    out = []
+    for i, tok in enumerate(re.split(r"(\s+)", line)):
+        if i == 0 and is_cmd:
+            name = tok[1:].lower()
+            known = any(n.startswith(name) for n in COMMANDS)    # a half-typed /con is still fine
+            out.append(("class:cmd" if known else "class:cmd-bad", tok))
+        elif tok.startswith("@") and len(tok) > 1:
+            out.append(("class:file", tok))
+        elif is_cmd and re.match(r"^--?[A-Za-z]", tok):
+            out.append(("class:flag", tok))
+        else:
+            out.append(("", tok))
+    return out
+
+
+def make_lexer():
+    from prompt_toolkit.lexers import Lexer
+
+    class InputLexer(Lexer):
+        def lex_document(self, document):
+            return lambda i: input_fragments(document.lines[i], first=i == 0)
+    return InputLexer()
+
+
+def caret_on(now, typed_at, period=0.53):
+    """Blink phase of the caret: solid while you type, then on/off every `period` seconds."""
+    return int((now - typed_at) / period) % 2 == 0
+
+
+def make_caret():
+    """Draws our own blinking caret. The terminal's cursor can't be trusted to blink: prompt_toolkit sends
+    'stop blinking' every time it redraws, and legacy Windows consoles ignore cursor shapes entirely."""
+    from prompt_toolkit.layout.processors import Processor, Transformation
+    from prompt_toolkit.layout.utils import explode_text_fragments
+
+    class BlinkingCaret(Processor):
+        def apply_transformation(self, ti):
+            doc = ti.document
+            if ti.lineno != doc.cursor_position_row:
+                return Transformation(ti.fragments)
+            col = ti.source_to_display(doc.cursor_position_col)
+            frags = list(explode_text_fragments(ti.fragments))
+            on = caret_on(time.time(), INPUT.get("typed", 0))
+            frags[col:col] = [("class:caret", "│") if on else ("", " ")]   # same width either way: no jitter
+            return Transformation(frags, source_to_display=lambda i: i if i <= col else i + 1,
+                                  display_to_source=lambda i: i if i <= col else i - 1)
+    return BlinkingCaret()
+
+
+def pulse_color(t, lo=(0x7a, 0x5c, 0x00), hi=(0xff, 0xd0, 0x00)):
+    """A slow yellow 'breathing' colour so the prompt box never looks frozen."""
+    k = (math.sin(t * 2.2) + 1) / 2
+    return "#%02x%02x%02x" % tuple(round(a + (b - a) * k) for a, b in zip(lo, hi))
+
+
+# ----------------------------------------------------------------------------- the screen (yellow on black)
+Y, Y_DIM, Y_SHADOW = "#ffd000", "#a37c00", "#5c4000"
+BG, PANEL, TEXT, MUTED = "#0a0a0a", "#1a1a1a", "#e8e8e8", "#7c7c7c"
+LOGO_GRADIENT = ["#ffee55", "#ffdd22", "#ffd000", "#ffc400", "#ffb400", "#ffa500"]    # one colour per pixel row
+LOGO_FONT = {                                                                        # 6 pixels tall
+    "B": ["#####.", "##..##", "#####.", "##..##", "##..##", "#####."],
+    "O": [".####.", "##..##", "##..##", "##..##", "##..##", ".####."],
+    "R": ["#####.", "##..##", "#####.", "##.##.", "##..##", "##..##"],
+    "W": ["##...##", "##...##", "##.#.##", "##.#.##", "#######", ".##.##."],
+}
+PLACEHOLDERS = ['Ask anything…  "what does this project do?"', 'Ask anything…  "fix the failing test in tests/"',
+                'Ask anything…  "add type hints to utils.py"', 'Ask anything…  "review @app.py for security bugs"']
+TIPS = [("Type ", "@", " to attach a file, Tab completes the path"),
+        ("Press ", "shift+tab", " to let the agent edit and run commands without asking"),
+        ("Run ", "/think", " to read the model's full reasoning for the last reply"),
+        ("Use ", "/review @file", " for a strict code review, most important issues first"),
+        ("Use ", "/clear", " to start a fresh conversation and come back here"),
+        ("Pipe input in from your shell: ", "git diff | borrow /review -", "")]
+CONNECT_TIP = ("Paste the ", "/connect <url> <key>", " line that qwen_serv.py prints on Kaggle")
+STYLE_RULES = {
+    "screen": f"bg:{BG}",
+    "box": f"bg:{PANEL} {TEXT}",
+    "bar": Y,
+    "placeholder": "#5a5a5a",
+    "auto-suggestion": "#5a5a5a",
+    "mode": f"{Y} bold",
+    "auto": f"bg:{Y} #000000 bold",
+    "model": f"{TEXT} bold",
+    "muted": MUTED,
+    "key": f"{TEXT} bold",
+    "tip": Y,
+    "tagline": Y_DIM,
+    "caret": f"{Y} bold",
+    "cmd": f"{Y} bold",
+    "cmd-bad": "#ff5f5f bold",
+    "flag": "#d7a7ff",
+    "file": "#5fafff underline",
+    "good": "#5fd75f",
+    "warn": "#ffaf00",
+    "bad": "#ff5f5f",
+    "completion-menu.completion": "bg:#1c1c1c #d0d0d0",
+    "completion-menu.completion.current": f"bg:{Y} #000000",
+    "completion-menu.meta.completion": "bg:#141414 #808080",
+    "completion-menu.meta.completion.current": f"bg:{Y_DIM} #000000",
+    "scrollbar.background": "bg:#262626",
+    "scrollbar.button": f"bg:{Y}",
+}
+INPUT = {}   # the prompt's buffer (history, completer) lives here between prompts
+
+
+def logo_fragments():
+    """BORROW in block letters with a drop shadow, drawn with half blocks: two square pixels per cell."""
+    if shutil.get_terminal_size().columns < 50:
+        return [("class:mode", "B O R R O W")]
+    rows = [".".join(LOGO_FONT[c][y] for c in "BORROW") for y in range(6)]
+    on = lambda x, y: 0 <= y < 6 and 0 <= x < len(rows[0]) and rows[y][x] == "#"
+    head = int(time.time() * 30) % (len(rows[0]) + 60) - 10        # a glint sweeps across, then pauses
+    lit = lambda x, y: "#fff6c0" if abs(x - y - head) < 2 else LOGO_GRADIENT[y]
+    color = lambda x, y: lit(x, y) if on(x, y) else Y_SHADOW if on(x - 1, y - 1) else BG
+    out = []
+    for y in range(0, 8, 2):
+        out += [(f"fg:{color(x, y)} bg:{color(x, y + 1)}", "▀") for x in range(len(rows[0]) + 1)]
+        out.append(("", "\n"))
+    return out[:-1]
+
+
+def info_fragments():
+    """The line under the input: mode · model · context."""
+    out = [("class:auto", " AUTO ") if STATE.get("auto_approve") else ("class:mode", "Agent"), ("class:muted", "  ·  ")]
+    if not STATE["url"]:
+        return out + [("class:bad", "not connected"), ("class:muted", "   /connect <url> <key>")]
+    if STATE.get("online") is None:
+        return out + [("class:muted", "connecting…")]
+    if not STATE["online"]:
+        return out + [("class:bad", "server not reachable"), ("class:muted", "   /status to retry")]
+    n, used = STATE.get("n_ctx") or 0, STATE.get("ctx_used") or 0
+    out.append(("class:model", STATE.get("model") or "connected"))
+    if n and used:
+        pct = used * 100 // n
+        out += [("class:bad" if pct >= 80 else "class:tip", f"   {ctx_meter(used, n)}"),
+                ("class:warn" if pct >= 80 else "class:muted", f" {fmt_k(used)} / {fmt_k(n)} context ({pct}%)")]
+    elif n:
+        out.append(("class:muted", f"   {fmt_k(n)} context"))
+    return out
+
+
+def hint_fragments():
+    if time.time() - INPUT.get("ctrl_c", 0) < 2:
+        return [("class:warn", "press ctrl+c again to quit ")]
+    out = []
+    for key, label in (("/", "commands"), ("@", "files"), ("shift+tab", "auto-approve"), ("ctrl+d", "quit")):
+        out += [("class:key", "   " + key), ("class:muted", " " + label)]
+    return out + [("", " ")]
+
+
+def status_fragments():
+    """Bottom bar of the start screen: folder and connection."""
+    cwd, home = str(Path.cwd()), str(Path.home())
+    cwd = "~" + cwd[len(home):] if cwd.startswith(home) else cwd
+    host = re.sub(r"^https?://", "", STATE["url"]).split("/")[0]
+    if not STATE["url"]:
+        dot, msg = "class:bad", "not connected"
+    elif STATE.get("online") is None:
+        dot, msg = "class:warn", f"connecting to {host}"
+    elif STATE["online"]:
+        dot, msg = "class:good", host
+    else:
+        dot, msg = "class:bad", f"{host} is not reachable"
+    room = shutil.get_terminal_size().columns - len(msg) - 28       # leave space for the version on the right
+    cwd = cwd if len(cwd) <= room else "…" + cwd[-room + 1:] if room > 10 else ""
+    return [("", "  "), (dot, "● "), ("class:muted", f"{msg}    {cwd}")]
+
+
+def read_input(splash=False):
+    """Draw the prompt box and return what the user submitted. splash=True draws the full-screen start screen.
+    Raises EOFError when the user quits."""
+    from prompt_toolkit.application import Application
     from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+    from prompt_toolkit.buffer import Buffer
+    from prompt_toolkit.filters import Condition, has_completions
     from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout import (ConditionalContainer, Float, FloatContainer, HSplit, Layout, VSplit, Window,
+                                       WindowAlign)
+    from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+    from prompt_toolkit.layout.dimension import Dimension as D
+    from prompt_toolkit.layout.menus import CompletionsMenu
+    from prompt_toolkit.layout.processors import AfterInput, AppendAutoSuggestion, ConditionalProcessor
+    from prompt_toolkit.output import ColorDepth
     from prompt_toolkit.styles import Style
-    style = Style.from_dict({
-        "completion-menu.completion": "bg:#262626 #d0d0d0",
-        "completion-menu.completion.current": "bg:#00afaf #000000",
-        "completion-menu.meta.completion": "bg:#1c1c1c #808080",
-        "completion-menu.meta.completion.current": "bg:#008787 #000000",
-        "bottom-toolbar": "bg:#1c1c1c #808080",
-    })
-    return PromptSession(
-        history=FileHistory(str(HISTORY_PATH)), completer=make_completer(), complete_while_typing=True,
-        auto_suggest=AutoSuggestFromHistory(), style=style, input=inp, output=out,
-        bottom_toolbar="  / commands   @ attach file   Ctrl+C stop reply   Ctrl+D quit")
+
+    buf = INPUT.get("buf")
+    if buf is None:
+        buf = INPUT["buf"] = Buffer(multiline=True, history=FileHistory(str(HISTORY_PATH)), completer=make_completer(),
+                                    complete_while_typing=True, auto_suggest=AutoSuggestFromHistory())
+        buf.on_cursor_position_changed += lambda _: INPUT.__setitem__("typed", time.time())   # caret solid while typing
+    empty = Condition(lambda: not buf.text)
+    INPUT["ctrl_c"] = 0
+    kb = KeyBindings()
+
+    @kb.add("enter")
+    def _submit(e):
+        state = buf.complete_state
+        if state and state.current_completion:       # Enter picks the highlighted menu item
+            buf.apply_completion(state.current_completion)
+        elif buf.text.strip():
+            buf.append_to_history()
+            e.app.exit(result=buf.text)
+
+    @kb.add("escape", "enter")
+    @kb.add("c-j")
+    def _newline(e):
+        buf.insert_text("\n")
+
+    @kb.add("s-tab", filter=~has_completions)
+    def _toggle_auto(e):
+        STATE["auto_approve"] = not STATE.get("auto_approve")
+
+    @kb.add("c-c")
+    def _ctrl_c(e):
+        if buf.text:
+            buf.reset()
+        elif time.time() - INPUT.get("ctrl_c", 0) < 2:
+            e.app.exit(exception=EOFError)
+        else:
+            INPUT["ctrl_c"] = time.time()
+
+    @kb.add("c-d", filter=empty)
+    def _quit(e):
+        e.app.exit(exception=EOFError)
+
+    off = random.randrange(len(PLACEHOLDERS))
+    placeholder = lambda: PLACEHOLDERS[(off + int(time.time() / 4)) % len(PLACEHOLDERS)]   # rotates every 4s
+    input_win = Window(BufferControl(buf, lexer=make_lexer(), input_processors=[
+        AppendAutoSuggestion(),
+        ConditionalProcessor(AfterInput(placeholder, style="class:placeholder"), empty),
+        make_caret()]),
+        height=D(min=1, max=10), dont_extend_height=True, wrap_lines=True, always_hide_cursor=True)
+    box = VSplit([
+        Window(width=1, char="┃", style=lambda: "fg:" + pulse_color(time.time())),
+        Window(width=2),
+        HSplit([Window(height=1), input_win, Window(height=1),
+                Window(FormattedTextControl(info_fragments), height=1), Window(height=1)]),
+        Window(width=1),
+    ], style="class:box")
+    hints = Window(FormattedTextControl(hint_fragments), height=1, align=WindowAlign.RIGHT)
+
+    if splash:
+        width = lambda: D.exact(max(30, min(78, shutil.get_terminal_size().columns - 4)))
+        tips = TIPS if STATE["url"] else [CONNECT_TIP]
+
+        def tip():                              # a new tip every 8s
+            a, b, c = tips[(off + int(time.time() / 8)) % len(tips)]
+            return [("fg:" + pulse_color(time.time()), "● Tip  "), ("class:muted", a), ("class:key", b), ("class:muted", c)]
+        body = HSplit([
+            Window(),
+            Window(FormattedTextControl(logo_fragments), height=4, align=WindowAlign.CENTER),
+            Window(height=1),
+            Window(FormattedTextControl([("class:tagline", "brain on remote  ·  run on workstation")]),
+                   height=1, align=WindowAlign.CENTER),
+            Window(height=2),
+            VSplit([Window(), HSplit([box, hints], width=width), Window()]),
+            Window(height=2),
+            Window(FormattedTextControl(tip), height=1, align=WindowAlign.CENTER),
+            Window(),
+            VSplit([Window(FormattedTextControl(status_fragments)),
+                    Window(FormattedTextControl([("class:muted", f"borrow {__version__}  ")]), dont_extend_width=True)],
+                   height=1),
+        ], style="class:screen")
+    else:
+        body = HSplit([box, hints, ConditionalContainer(Window(height=8), filter=has_completions)])  # room for the menu
+
+    truecolor = os.environ.get("COLORTERM") in ("truecolor", "24bit") or os.environ.get("WT_SESSION")
+    app = Application(
+        layout=Layout(FloatContainer(body, floats=[Float(xcursor=True, ycursor=True,
+                                                         content=CompletionsMenu(max_height=8, scroll_offset=1))]),
+                      focused_element=input_win),
+        key_bindings=kb, style=Style.from_dict(STYLE_RULES), full_screen=splash, erase_when_done=True,
+        refresh_interval=0.1, color_depth=ColorDepth.TRUE_COLOR if truecolor else None)   # 0.1s drives the animations
+    try:
+        return app.run()
+    finally:
+        buf.reset()
 
 
-def get_session():
+def print_user_block(text):
+    """Echo what the user sent as a panel with a yellow bar, matching the prompt box it came from."""
+    if not TTY:
+        return
+    cols = shutil.get_terminal_size((80, 20)).columns - 1
+    lines = []
+    for para in text.replace("\t", "    ").splitlines():
+        lines += textwrap.wrap(para, max(10, cols - 4)) or [""]
+    if len(lines) > 12:
+        lines = lines[:12] + [f"… {len(lines) - 12} more lines"]
+    for i, line in enumerate(["", *lines, ""]):
+        line = line.ljust(cols - 3)
+        if i == 1 and text.startswith("/"):     # the /command keeps its yellow after you send it
+            name = line.split(" ", 1)[0]
+            line = f"\033[38;5;220m\033[1m{name}\033[22m\033[38;5;255m{line[len(name):]}"
+        print(f"\033[48;5;234m\033[38;5;220m┃\033[38;5;255m  {line}\033[0m")
+
+
+def ensure_prompt_toolkit():
     try:
         __import__("prompt_toolkit")
+        return True
     except ImportError:
         print(dim("Installing prompt_toolkit (gives you the / menu)..."))
         r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "prompt_toolkit"],
                            capture_output=True, text=True)
         if r.returncode != 0:
             print(red("Could not install prompt_toolkit; using basic mode (no menu). Run: pip install prompt_toolkit"))
-            return None
-    try:
-        return build_session()
-    except Exception as e:
-        print(red(f"Menu unavailable ({e}); using basic mode."))
-        return None
+            return False
+        return True
 
 
 def basic_prompt():
@@ -1280,24 +1750,61 @@ def basic_prompt():
     return lambda: input("> ")
 
 
-def repl(session=None):
-    prompt = (lambda: session.prompt("> ")) if session else basic_prompt()
-    print(bold("borrow") + dim("  Qwen coder CLI   type / for commands, @ to attach files, /help for details"))
-    if not STATE["url"]:
-        print(red("Not connected yet. Type /connect <url> <key>  (or set ASK_URL and ASK_KEY)."))
-    elif not health():
-        print(red("Saved endpoint is not reachable. If you started a new Kaggle session, use /connect with the new URL and key."))
+def repl():
+    fancy = TTY and sys.stdin.isatty() and ensure_prompt_toolkit()
+    prompt = None if fancy else basic_prompt()
+    if fancy:
+        threading.Thread(target=fetch_server_info, daemon=True).start()
+    else:
+        print(bold("borrow") + dim("  Qwen coder CLI   type / for commands, @ to attach files, /help for details"))
+        if not STATE["url"]:
+            print(red("Not connected yet. Type /connect <url> <key>  (or set ASK_URL and ASK_KEY)."))
+        elif not health():
+            print(red("Saved endpoint is not reachable. If you started a new Kaggle session, use /connect with the new URL and key."))
+    splash = fancy
     while True:
         try:
-            line = prompt()
+            line = read_input(splash) if fancy else prompt()
         except KeyboardInterrupt:
-            print(dim("(Ctrl+D or /exit to quit)"))
+            if not fancy:
+                print(dim("(Ctrl+D or /exit to quit)"))
             continue
         except EOFError:
             break
-        if not handle(line):
-            break
+        except Exception as e:                  # a console prompt_toolkit cannot drive
+            print(red(f"Prompt box unavailable ({e}); using basic mode."))
+            fancy, splash, prompt = False, False, basic_prompt()
+            continue
+        if fancy:
+            if splash:
+                sys.stdout.write("\033[2J\033[H")   # leave the start screen onto a blank page
+                splash = False
+            print_user_block(line.strip())
+            print()
+        try:
+            if not handle(line):
+                break
+        except KeyboardInterrupt:
+            print(dim("\n[interrupted]"))
+        splash = STATE.pop("show_splash", False) and fancy
+        if fancy and not splash:
+            print()
     print(dim("bye"))
+
+
+def enable_ansi():
+    """Windows consoles only understand colour codes once VT processing is switched on."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        for std in (-11, -12):                  # stdout, stderr
+            handle, mode = k32.GetStdHandle(std), ctypes.c_uint32()
+            if k32.GetConsoleMode(handle, ctypes.byref(mode)):
+                k32.SetConsoleMode(handle, mode.value | 0x0004)
+    except Exception:
+        pass
 
 
 def main():
@@ -1324,10 +1831,11 @@ def main():
             print(red(str(e)))
             sys.exit(1)
         return
-    repl(get_session())
+    repl()
 
 
 def run():
+    enable_ansi()
     try:
         main()
     except BrokenPipeError:                     # e.g. output piped into `head`

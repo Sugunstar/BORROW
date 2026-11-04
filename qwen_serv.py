@@ -17,19 +17,23 @@ import glob, json, os, re, secrets, shutil, socket, subprocess, time
 import requests
 
 # ----------------------------- settings you may edit -----------------------------
-MODEL_CHOICE = "auto"   # "auto" | "coder32b_dense" | "coder30b" | "coder14b_dense" | "qwen35_27b" | "qwen35_9b"
+MODEL_CHOICE = "auto"   # "auto" or a preset name below. Either way, if a model fails the next one that fits is tried
 THINKING     = True     # Enable reasoning/thinking when supported by the model (better accuracy)
 PORT         = 8080
 UA           = {"User-Agent": "curl/8.5.0"}   # Cloudflare can reject python's default user agent
 
-PRESETS = {   # min_vram_gb = total VRAM across all visible GPUs needed for this preset
-    # Dense coder models: highest accuracy and code reasoning depth
-    "coder32b_dense": dict(repo="unsloth/Qwen2.5-Coder-32B-Instruct-GGUF", quant="Q4_K_M", ctx=32768, min_vram_gb=26),
-    "coder14b_dense": dict(repo="unsloth/Qwen2.5-Coder-14B-Instruct-GGUF", quant="Q4_K_M", ctx=32768, min_vram_gb=12),
-    # MoE coder model: fast token generation (3.3B active parameters per token)
+PRESETS = {   # tried in this order (best first); min_vram_gb = total VRAM across all visible GPUs
+    # Best quality: dense 27B, top open-model coding scores at this size (19.8 GB file)
+    "qwen38_27b":     dict(repo="unsloth/Qwen3.8-27B-GGUF",                  quant="UD-Q5_K_M", ctx=32768, min_vram_gb=26),
+    # Fast MoE (3B active per token): several times quicker on T4s, slightly lower quality (22.1 GB)
+    "qwen36_35b_a3b": dict(repo="unsloth/Qwen3.6-35B-A3B-GGUF",              quant="UD-Q4_K_M", ctx=32768, min_vram_gb=26),
+    # The same 27B at 4-bit, in case the 5-bit build runs out of memory (16.5 GB)
+    "qwen38_27b_q4":  dict(repo="unsloth/Qwen3.8-27B-GGUF",                  quant="UD-Q4_K_M", ctx=32768, min_vram_gb=22),
+    # Older models, known to work with this script
     "coder30b":       dict(repo="unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF", quant="Q4_K_M", ctx=32768, min_vram_gb=26),
-    # General-purpose Qwen3.5 models (with thinking support)
     "qwen35_27b":     dict(repo="unsloth/Qwen3.5-27B-GGUF",                  quant="Q4_K_M", ctx=16384, min_vram_gb=24),
+    "coder32b_dense": dict(repo="unsloth/Qwen2.5-Coder-32B-Instruct-GGUF",   quant="Q4_K_M", ctx=32768, min_vram_gb=26),
+    "coder14b_dense": dict(repo="unsloth/Qwen2.5-Coder-14B-Instruct-GGUF",   quant="Q4_K_M", ctx=32768, min_vram_gb=12),
     "qwen35_9b":      dict(repo="unsloth/Qwen3.5-9B-GGUF",                   quant="Q4_K_M", ctx=16384, min_vram_gb=10),
 }
 # ---------------------------------------------------------------------------------
@@ -110,13 +114,18 @@ def pick_workdir(need_gb=35):
     return path
 
 
-def choose_preset(total_vram):
+def preset_order(total_vram):
+    """Presets to try, best first: MODEL_CHOICE (if set), then every preset that fits in the VRAM."""
+    order = [k for k, p in PRESETS.items() if total_vram >= p["min_vram_gb"]]
     if MODEL_CHOICE != "auto":
-        return MODEL_CHOICE, PRESETS[MODEL_CHOICE]
-    for key in ("coder30b", "coder14b_dense", "qwen35_9b"):
-        if total_vram >= PRESETS[key]["min_vram_gb"]:
-            return key, PRESETS[key]
-    raise RuntimeError(f"Only {total_vram:.0f} GB VRAM visible; need at least 10 GB.")
+        order = [MODEL_CHOICE] + [k for k in order if k != MODEL_CHOICE]
+    if not order:
+        raise RuntimeError(f"Only {total_vram:.0f} GB VRAM visible; need at least 10 GB.")
+    return order
+
+
+class GpuError(RuntimeError):
+    """The server runs on CPU. A problem with llama-server itself, so trying other models won't help."""
 
 
 def find_nvcc():
@@ -146,6 +155,14 @@ def find_libcuda():
     real = [f for f in found if "/stubs/" not in f]
     stubs = [f for f in found if "/stubs/" in f]
     return (real or stubs or [None])[0]
+
+
+def server_env(binary):
+    """Env for llama-server: its own dir (libggml-cuda.so) plus the CUDA runtime libs on the library path."""
+    env = dict(os.environ)
+    dirs = [os.path.dirname(binary)] + glob.glob("/usr/local/cuda/lib64") + glob.glob("/usr/local/nvidia/lib64")
+    env["LD_LIBRARY_PATH"] = ":".join(dirs + [env.get("LD_LIBRARY_PATH", "")])
+    return env
 
 
 def try_download_prebuilt_llama():
@@ -180,24 +197,46 @@ def try_download_prebuilt_llama():
             if "llama-server" in files:
                 cand = os.path.join(root, "llama-server")
                 os.chmod(cand, 0o755)
-                # Verify that it runs and links against system libraries
-                env = dict(os.environ)
-                env["LD_LIBRARY_PATH"] = root + ":" + env.get("LD_LIBRARY_PATH", "")
-                r = subprocess.run([cand, "--version"], capture_output=True, text=True, env=env)
-                if r.returncode == 0:
+                ok, out = cuda_check(cand)
+                if ok:
                     SERVER_BIN = cand
-                    print(f"  Prebuilt llama-server verified: {SERVER_BIN}")
+                    print(f"  Prebuilt llama-server verified on GPU: {SERVER_BIN}")
                     return True
+                print("  Prebuilt llama-server cannot see the GPU, compiling instead. It said:\n" + out[-1500:])
+                return False
     except Exception as e:
         print(f"  Prebuilt binary attempt skipped ({e}), falling back to compilation.")
     return False
 
 
+def cuda_check(binary):
+    """(True, output) if this llama-server can see a CUDA GPU. `--version` is no proof: a build whose CUDA
+    backend fails to load still runs, silently on CPU. A usable GPU shows up as a 'CUDA0: Tesla T4' line."""
+    try:
+        r = subprocess.run([binary, "--list-devices"], capture_output=True, text=True,
+                           env=server_env(binary), timeout=120)
+        out = (r.stdout + r.stderr).strip()
+        return r.returncode == 0 and re.search(r"\bCUDA\d+:", out) is not None, out
+    except Exception as e:
+        return False, str(e)
+
+
+def gpu_mem_used_gb():
+    """VRAM in use across all GPUs (GB), or -1 if nvidia-smi fails."""
+    r = subprocess.run(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                       capture_output=True, text=True)
+    return sum(float(x) for x in r.stdout.split()) / 1024 if r.returncode == 0 else -1
+
+
 def setup_llama_cpp(arch):
     global SERVER_BIN
     if SERVER_BIN and os.path.exists(SERVER_BIN):
-        print("llama-server already available, skipping.")
-        return
+        ok, out = cuda_check(SERVER_BIN)
+        if ok:
+            print("llama-server already available and sees the GPU, skipping.")
+            return
+        print("Existing llama-server cannot see the GPU, rebuilding it. It said:\n" + out[-1500:])
+        shutil.rmtree(os.path.dirname(os.path.dirname(SERVER_BIN)), ignore_errors=True)   # its build/ folder
     print("Checking for prebuilt CUDA-accelerated llama-server (fast setup)...")
     if try_download_prebuilt_llama():
         return
@@ -310,11 +349,10 @@ def start_server(model_path, ctx, repo):
     cmd = [SERVER_BIN, "-m", model_path, "-ngl", "99", "-c", str(ctx),
            "--host", "127.0.0.1", "--port", str(PORT),
            "--api-key", API_KEY, "--alias", "qwen"]
-    if "Qwen3.5" in repo and not THINKING:      # Qwen3-Coder has no thinking mode, so no flag needed
+    if re.search(r"Qwen3\.\d", repo) and not THINKING:   # Qwen3.5/3.6/3.8 can think; Qwen3-Coder can't
         cmd += ["--chat-template-kwargs", json.dumps({"enable_thinking": False})]
-    env = dict(os.environ)
+    env = server_env(SERVER_BIN)
     env["LLAMA_ARG_FLASH_ATTN"] = "on"
-    env["LD_LIBRARY_PATH"] = os.path.dirname(SERVER_BIN) + ":" + env.get("LD_LIBRARY_PATH", "")
     SERVER_PROC = subprocess.Popen(cmd, stdout=open(log_path, "w"), stderr=subprocess.STDOUT,
                                    env=env, cwd=os.path.dirname(SERVER_BIN))
     deadline = time.time() + 600       # loading ~19 GB from disk can take a few minutes
@@ -331,8 +369,15 @@ def start_server(model_path, ctx, repo):
     else:
         print(open(log_path).read()[-4000:])
         raise TimeoutError("Server did not become ready within 10 minutes.")
-    gpu_lines = [l.strip() for l in open(log_path) if "offloaded" in l]
-    print("Server ready.", gpu_lines[-1] if gpu_lines else f"(see {log_path} for GPU offload info)")
+    log = open(log_path, errors="replace").read()
+    gpu_lines = [l.strip() for l in log.splitlines() if "offloaded" in l]
+    vram = gpu_mem_used_gb()          # ground truth: the model's weights sit in VRAM, many GB of it
+    if 0 <= vram < 1:
+        print("\n".join(l for l in log.splitlines() if re.search(r"cuda|gpu|offload|error|fail", l, re.I))[-3000:])
+        stop_server()
+        raise GpuError(f"llama-server loaded the model on CPU (only {vram:.1f} GB VRAM in use). The GPU lines "
+                           f"from its log are printed above; paste them to get this fixed. Full log: {log_path}")
+    print(f"Server ready. {vram:.1f} GB VRAM in use.", gpu_lines[-1] if gpu_lines else "")
 
 
 def test_chat(base, prompt="Write a Python one-liner that reverses a string."):
@@ -426,16 +471,27 @@ def main():
     arch, total_vram = check_gpus()
     WORK = pick_workdir()
     SERVER_BIN = f"{WORK}/llama.cpp/build/bin/llama-server"
-    key, preset = choose_preset(total_vram)
-    print(f"Model preset: {key} -> {preset['repo']} ({preset['quant']}), context {preset['ctx']}")
+    order = preset_order(total_vram)
+    print("Models to try, best first:", " -> ".join(order))
 
     print("[2/6] Setting up llama.cpp")
     setup_llama_cpp(arch)
-    print("[3/6] Downloading model")
-    model_path = download_model(preset["repo"], preset["quant"])
-    print("[4/6] Starting server")
-    start_server(model_path, preset["ctx"], preset["repo"])
-    test_chat(f"http://127.0.0.1:{PORT}")
+    for i, key in enumerate(order):             # a model that fails to download, load or answer -> next one
+        preset = PRESETS[key]
+        print(f"[3/6] Downloading model: {key} -> {preset['repo']} ({preset['quant']}), context {preset['ctx']}")
+        try:
+            model_path = download_model(preset["repo"], preset["quant"])
+            print("[4/6] Starting server")
+            start_server(model_path, preset["ctx"], preset["repo"])
+            test_chat(f"http://127.0.0.1:{PORT}")
+            break
+        except GpuError:
+            raise
+        except Exception as e:
+            stop_server()
+            if i == len(order) - 1:
+                raise
+            print(f"\nModel {key} failed: {e}\nFalling back to {order[i + 1]}...\n")
     print("[5/6] Opening tunnel")
     public_url = start_tunnel()
     print("\nPublic URL:", public_url)

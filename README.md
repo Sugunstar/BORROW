@@ -120,12 +120,16 @@ Kaggle sessions are ephemeral. When you start a new Kaggle notebook session, run
 
 ## Using the CLI
 
+Running `borrow` opens a full-screen start page in yellow and black: the **BORROW** logo, a prompt box showing the agent mode, the connected **model** and its **context size**, key hints, a tip, and a status bar (connection, folder, version). After your first message the page clears and the conversation scrolls normally, with the same prompt box under each reply showing how full the context window is (for example `9.8K / 32K context (30%)`).
+
 - **Interactive Autonomous Agent:** Simply type instructions in plain English (e.g. `refactor auth.py to use JWT` or `fix the failing pytest`).
 - Type **`/`** to open the interactive command dropdown menu. Filter by typing and navigate with arrow keys or Tab.
 - Type **`-`** after any command to view supported flags.
 - Type **`@`** to attach files with Tab autocomplete (e.g. `@app.py`).
 - **Confirmation Prompts:** The agent previews exact unified diffs and command runs, asking `[Y/n/a(ll)]`. Press `a` to auto-approve remaining actions for that session.
-- **Ctrl+C** stops current generation or running command. **Ctrl+D** or `/exit` exits the agent.
+- **Shift+Tab** toggles auto-approve (the prompt box shows an `AUTO` badge while it is on).
+- **Ctrl+J** or **Alt+Enter** adds a new line to your message; **Enter** sends it (or picks the highlighted menu item).
+- **Ctrl+C** stops current generation or running command, or clears the prompt; press it twice on an empty prompt to quit. **Ctrl+D** or `/exit` exits the agent.
 
 ## Autonomous Agent Workflows
 
@@ -154,11 +158,13 @@ Like Claude Code and `agy`, `borrow` operates as a true autonomous software engi
 - **Greeting & Intent Guard**: Conversational greetings (`hi`, `hello`, `who are you?`) are handled naturally without unprompted file creations or unsolicited directory scans.
 
 ### Live Visual Feedback
-- **Braille Spinner & Token Counters**: When the model prepares tool arguments or reasons through steps, a real-time animated spinner displays the tool name and accumulated token count:
+- **Thinking line**: While the model works, one live line shows a shimmering `Thinking…` label, elapsed time, token count and a peek at the newest words of its reasoning. When it finishes thinking, the line collapses to a one-line summary, and `/think` prints the full reasoning:
   ```
-  ⠋ Preparing write_file... (214 tokens)
+  ⠋ Thinking… 3.4s · 182 tokens  …so the retry loop caps the delay at thirty seconds
+  ◇ Thought for 3.4s · 182 tokens
   ```
-- **Execution Spinners**: Live animated feedback while running shell commands or scanning files.
+- **Tool lines**: Each tool call shows as one line, e.g. `● Read borrow.py` or `● Run pytest -q`; while arguments stream in you see `⠋ Preparing write_file… 1.2s · 214 tokens`.
+- **Reply footer**: Every reply ends with `◆ Agent · <model> · 4.2s · 61 tok/s`.
 
 ## Talking to the model
 
@@ -196,7 +202,8 @@ Prefixing prompts with a command sends specialized system instructions:
 | `/shell <what you want>` | Translate natural language into a shell command with confirmation | `-t` |
 | `/connect [<url> <key>]` | Configure or view the active Cloudflare endpoint and API key | |
 | `/status` | Verify remote server connectivity and model health | |
-| `/clear` | Reset chat history and start a fresh session | |
+| `/think` | Show the model's full reasoning for the last reply | |
+| `/clear` | Reset chat history and return to the start screen | |
 | `/help [command]` | Display detailed command reference and examples | |
 | `/exit` | Exit the CLI (or press `Ctrl+D`) | |
 
