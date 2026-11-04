@@ -20,6 +20,7 @@ No local GPU, no API subscription fees, and no closed-source vendor lock-in.
 - [Quick start](#quick-start)
 - [Using the CLI](#using-the-cli)
 - [Autonomous Agent Workflows](#autonomous-agent-workflows)
+- [Agent Skills](#agent-skills)
 - [Talking to the model](#talking-to-the-model)
 - [Commands](#commands)
 - [Attaching files](#attaching-files)
@@ -37,7 +38,7 @@ No local GPU, no API subscription fees, and no closed-source vendor lock-in.
 | File | Runs on | Purpose |
 |---|---|---|
 | `qwen_serv.py` | Kaggle notebook | Prebuilt CUDA `llama-server`, fast Hugging Face model downloads, starts OpenAI-compatible API server, and opens Cloudflare tunnel |
-| `borrow.py` + `pyproject.toml` | Your workstation | The `borrow` CLI: Autonomous agent loop, tool execution (read/edit/write/search/run), interactive colored diffs, live streaming spinners, command menu, and chat memory |
+| `borrow.py` + `pyproject.toml` | Your workstation | The `borrow` CLI: Autonomous agent loop, tool execution (read/edit/write/search/run/load_skill), agent skills system, interactive colored diffs, live streaming spinners, command menu, and chat memory |
 
 Observed performance on Kaggle 2x Tesla T4:
 - **Qwen3-Coder-30B-A3B (MoE):** ~58–68 tokens/second (3.3B active parameters per token).
@@ -138,7 +139,7 @@ Once connected, `borrow` opens a full-screen start page in yellow and black: the
 Like Claude Code and `agy`, `borrow` operates as a true autonomous software engineer:
 
 ```
- User Request ──► Agent ReAct Loop ──► Tool Call (read/edit/search/exec)
+ User Request ──► Agent ReAct Loop ──► Tool Call (read/edit/search/exec/skill)
       ▲                     │                         │
       │                     ▼                         ▼
       └────────── Response / Final Answer ◄── Confirmation & Tool Output
@@ -151,6 +152,7 @@ Like Claude Code and `agy`, `borrow` operates as a true autonomous software engi
 4. **`list_directory(path)`**: Explores folder structures, skipping ignored directories (`.git`, `__pycache__`, etc.).
 5. **`search_files(query, path)`**: Regex-powered workspace search across text files.
 6. **`run_command(command)`**: Executes shell commands (e.g. `pytest`, `python app.py`, `npm test`) with output capture and 120s timeout.
+7. **`load_skill(name)`**: Loads full instructions, rules, and script manifests from an agent skill by name.
 
 ### Safety & Control
 - **Interactive Colored Diffs**: Every file modification displays an ANSI unified diff preview (`+added`, `-removed`, `@@hunk@@`).
@@ -167,6 +169,51 @@ Like Claude Code and `agy`, `borrow` operates as a true autonomous software engi
   ```
 - **Tool lines**: Each tool call shows as one line, e.g. `● Read borrow.py` or `● Run pytest -q`; while arguments stream in you see `⠋ Preparing write_file… 1.2s · 214 tokens`.
 - **Reply footer**: Every reply ends with `◆ Agent · <model> · 4.2s · 61 tok/s`.
+
+## Agent Skills
+
+Borrow supports **Agent Skills** (compatible with Claude Code and Antigravity `agy` specifications). Skills are reusable bundles of instructions, scripts, and workflows.
+
+### Directory Structure & Layout
+Skills are placed in `.borrow/skills/<skill-name>/`, `.agents/skills/<skill-name>/`, or globally in `~/.borrow/skills/<skill-name>/`:
+
+```
+.borrow/skills/code-audit/
+├── SKILL.md            # Required: YAML frontmatter + instructions
+├── scripts/            # Optional: verification or automation scripts
+└── references/         # Optional: checklists or reference documentation
+```
+
+### `SKILL.md` Format
+```markdown
+---
+name: code-audit
+description: Rigorous security and performance review with automated static analysis.
+---
+
+# Code Audit Workflow
+1. Run static checks and inspect dependencies...
+2. Check for SQL injection, auth leaks, and memory bottlenecks...
+```
+
+### Using Skills
+- **/skills**: Lists all available workspace and global skills:
+  ```
+  > /skills
+  Available Skills (2 found):
+    qa-review [workspace]
+      Run a full independent QA pass on the borrow project...
+    qa-tests [workspace]
+      Write or extend the automated pytest suite for borrow...
+  ```
+- **/skill <name> [prompt]**: Run a specific skill or view its documentation:
+  ```
+  > /skill qa-tests write tests for user authentication
+  > /skill qa-review
+  ```
+- **/skill init <name>**: Scaffolds a new skill directory with starter frontmatter in `.borrow/skills/<name>/SKILL.md`.
+- **Tab Autocomplete**: In the REPL, typing `/skill ` and pressing Tab autocompletes skill names with live description hints.
+- **Autonomous Tool Calling**: The agent dynamically sees available skills in its workspace summary and can call `load_skill` whenever a user query matches a skill's description.
 
 ## Talking to the model
 
@@ -191,6 +238,8 @@ Prefixing prompts with a command sends specialized system instructions:
 | Command | What it does | Flags |
 |---|---|---|
 | `/edit <instructions>` | Autonomous agent task: inspects, edits files, and runs verification | `-t TEMP` `-m N` |
+| `/skills` | List all discovered workspace and global agent skills | |
+| `/skill <name> [prompt]` | Run an agent skill, view its instructions, or scaffold (`init <name>`) | `-t TEMP` `-m N` |
 | `/auto` | Toggle auto-approving file edits and shell commands | |
 | `/diff` | Display `git diff` of uncommitted changes across workspace | |
 | `/revert [file]` | Revert uncommitted changes in a file (`git checkout -- <file>`) | |
@@ -241,6 +290,9 @@ Attach local files to any query using `@`:
 Execute autonomous tasks or queries directly from your shell or CI/CD pipelines without entering the interactive REPL:
 
 ```bash
+# Run a skill directly from the shell
+borrow /skill qa-tests "write tests for auth.py"
+
 # Autonomous edit with auto-approval
 borrow -y "add docstrings and type annotations to utils.py"
 
@@ -261,6 +313,7 @@ pytest -v
 ```
 
 Features tested:
+- Skills system: YAML frontmatter parsing, workspace/global discovery precedence, `tool_load_skill`, `prompt_toolkit` completers, `/skill init`, `/skills`, and `/skill`.
 - Tool execution: `tool_read_file`, `tool_edit_file`, `tool_write_file`, `tool_list_directory`, `tool_search_files`, `tool_run_command`.
 - Workspace protection and directory boundary confinement.
 - Unified colored diff generation and fallback behavior.
