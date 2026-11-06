@@ -205,8 +205,11 @@ Prefixing prompts with a command sends specialized system instructions:
 | `/connect [<url> <key>]` | Configure or view the active Cloudflare endpoint and API key | |
 | `/notebook [<notebook URL>]` | Set or show the Kaggle notebook the **Connect** button opens | |
 | `/status` | Verify remote server connectivity and model health | |
+| `/session [on\|off]` | Toggle or view folder-level session persistence and auto-save | |
+| `/autocompact [on\|off]` | Toggle or view auto-compaction when reaching context window threshold | |
+| `/context [MAX\|<number>]` | Set or show context window size (`MAX` or custom token limit) | |
 | `/think` | Show the model's full reasoning for the last reply | |
-| `/clear` | Reset chat history and return to the start screen | |
+| `/clear` | Reset chat history and delete the local folder session | |
 | `/help [command]` | Display detailed command reference and examples | |
 | `/exit` | Exit the CLI (or press `Ctrl+D`) | |
 

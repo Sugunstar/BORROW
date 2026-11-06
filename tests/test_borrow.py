@@ -441,3 +441,149 @@ class TestConnectBanner(unittest.TestCase):
             save.assert_called_once()
             with self.assertRaises(borrow.UserError):
                 borrow.handle("/notebook not-a-notebook", raise_errors=True)
+
+
+class TestSessionAndContext(unittest.TestCase):
+    def test_session_save_and_load(self):
+        with tempfile.TemporaryDirectory() as td:
+            cwd = os.getcwd()
+            try:
+                os.chdir(td)
+                with patch.dict(borrow.STATE, history=[{"role": "user", "content": "hi"}], ctx_used=42, session_enabled=True):
+                    borrow.save_session()
+                    session_file = Path(td) / ".borrow" / "session.json"
+                    self.assertTrue(session_file.is_file())
+
+                    # Reset STATE and load
+                    borrow.STATE["history"] = []
+                    borrow.STATE["ctx_used"] = 0
+                    borrow.load_session()
+                    self.assertEqual(borrow.STATE["history"], [{"role": "user", "content": "hi"}])
+                    self.assertEqual(borrow.STATE["ctx_used"], 42)
+            finally:
+                os.chdir(cwd)
+
+    def test_session_toggle_command(self):
+        with tempfile.TemporaryDirectory() as td:
+            cwd = os.getcwd()
+            try:
+                os.chdir(td)
+                with patch.dict(borrow.STATE, session_enabled=True, history=[{"role": "user", "content": "test"}]):
+                    borrow.handle("/session off")
+                    self.assertFalse(borrow.STATE["session_enabled"])
+                    session_file = Path(td) / ".borrow" / "session.json"
+                    self.assertFalse(session_file.exists())
+
+                    borrow.handle("/session on")
+                    self.assertTrue(borrow.STATE["session_enabled"])
+                    self.assertTrue(session_file.is_file())
+            finally:
+                os.chdir(cwd)
+
+    def test_clear_removes_session_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            cwd = os.getcwd()
+            try:
+                os.chdir(td)
+                with patch.dict(borrow.STATE, history=[{"role": "user", "content": "test"}], session_enabled=True):
+                    borrow.save_session()
+                    session_file = Path(td) / ".borrow" / "session.json"
+                    self.assertTrue(session_file.is_file())
+
+                    borrow.handle("/clear")
+                    self.assertEqual(borrow.STATE["history"], [])
+                    self.assertFalse(session_file.exists())
+            finally:
+                os.chdir(cwd)
+
+    def test_folder_level_session_isolation(self):
+        with tempfile.TemporaryDirectory() as td1, tempfile.TemporaryDirectory() as td2:
+            cwd = os.getcwd()
+            try:
+                os.chdir(td1)
+                with patch.dict(borrow.STATE, history=[{"role": "user", "content": "in folder 1"}], session_enabled=True):
+                    borrow.save_session()
+
+                os.chdir(td2)
+                with patch.dict(borrow.STATE, history=[{"role": "user", "content": "in folder 2"}], session_enabled=True):
+                    borrow.save_session()
+
+                # Verify folder 1 has only folder 1 content
+                os.chdir(td1)
+                borrow.STATE["history"] = []
+                borrow.load_session()
+                self.assertEqual(borrow.STATE["history"], [{"role": "user", "content": "in folder 1"}])
+
+                # Verify folder 2 has only folder 2 content
+                os.chdir(td2)
+                borrow.STATE["history"] = []
+                borrow.load_session()
+                self.assertEqual(borrow.STATE["history"], [{"role": "user", "content": "in folder 2"}])
+            finally:
+                os.chdir(cwd)
+
+    def test_connect_preserves_history(self):
+        existing_history = [{"role": "user", "content": "Keep my work"}]
+        with patch.dict(borrow.STATE, history=list(existing_history), url="", key=""), \
+             patch.object(borrow, "save_config"), \
+             patch.object(borrow, "fetch_server_info"):
+            borrow.do_connect("https://new-tunnel.trycloudflare.com", "KEY123")
+            self.assertEqual(borrow.STATE["history"], existing_history)
+
+    def test_autocompact_toggle(self):
+        with patch.dict(borrow.STATE, autocompact_enabled=True, n_ctx=10000, ctx_used=9000,
+                        history=[{"role": "user", "content": "msg"}] * 6):
+            with patch.object(borrow, "compact") as mock_compact:
+                borrow.maybe_compact()
+                mock_compact.assert_called_once()
+
+            # Now disable autocompact
+            borrow.handle("/autocompact off")
+            self.assertFalse(borrow.STATE["autocompact_enabled"])
+            with patch.object(borrow, "compact") as mock_compact:
+                borrow.maybe_compact()
+                mock_compact.assert_not_called()
+
+            # Re-enable
+            borrow.handle("/autocompact on")
+            self.assertTrue(borrow.STATE["autocompact_enabled"])
+
+    def test_context_command_max_and_custom(self):
+        with patch.dict(borrow.STATE, context_limit="MAX", server_n_ctx=32768, n_ctx=32768):
+            self.assertEqual(borrow.effective_n_ctx(), 32768)
+
+            # Set custom context limit
+            borrow.handle("/context 8192")
+            self.assertEqual(borrow.STATE["context_limit"], 8192)
+            self.assertEqual(borrow.STATE["n_ctx"], 8192)
+            self.assertEqual(borrow.effective_n_ctx(), 8192)
+
+            # Set with alias /ctx
+            borrow.handle("/ctx 16384")
+            self.assertEqual(borrow.STATE["context_limit"], 16384)
+            self.assertEqual(borrow.STATE["n_ctx"], 16384)
+
+            # Reset back to MAX
+            borrow.handle("/context MAX")
+            self.assertEqual(borrow.STATE["context_limit"], "MAX")
+            self.assertEqual(borrow.STATE["n_ctx"], 32768)
+            self.assertEqual(borrow.effective_n_ctx(), 32768)
+
+            # Invalid input raises UserError
+            with self.assertRaises(borrow.UserError):
+                borrow.handle("/context invalid", raise_errors=True)
+            with self.assertRaises(borrow.UserError):
+                borrow.handle("/context 50", raise_errors=True)
+
+    def test_extract_text_tool_calls(self):
+        text = 'Here is the plan:\n<tool_call>\n{"name": "write_file", "arguments": {"path": "test.txt", "content": "hello"}}\n</tool_call>'
+        calls = borrow.extract_text_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "write_file")
+        self.assertIn("test.txt", calls[0]["function"]["arguments"])
+
+        # Test markdown code block wrapping
+        text_md = '<tool_call>\n```json\n{"name": "read_file", "arguments": {"path": "app.py"}}\n```\n</tool_call>'
+        calls_md = borrow.extract_text_tool_calls(text_md)
+        self.assertEqual(len(calls_md), 1)
+        self.assertEqual(calls_md[0]["function"]["name"], "read_file")

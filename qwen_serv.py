@@ -18,23 +18,21 @@ import glob, json, os, re, secrets, shutil, socket, subprocess, threading, time
 import requests
 
 # ----------------------------- settings you may edit -----------------------------
-MODEL_CHOICE = "auto"   # "auto" or a preset name below. Either way, if a model fails the next one that fits is tried
-THINKING     = True     # Enable reasoning/thinking when supported by the model (better accuracy)
-PORT         = 8080
-UA           = {"User-Agent": "curl/8.5.0"}   # Cloudflare can reject python's default user agent
+MODEL_CHOICE   = "auto"           # "auto" (picks best coder model), "coder30b", "coder32b_dense", etc.
+KV_CACHE_QUANT = "q4_0"           # "q4_0", "q8_0", or "f16". q4_0 cuts KV cache by 4x, fitting large context purely in VRAM
+THINKING       = False            # False = immediate execution for coding agents (creates files/edits directly). True = long internal monologue
+PORT           = 8080
+UA             = {"User-Agent": "curl/8.5.0"}   # Cloudflare can reject python's default user agent
 
 PRESETS = {   # tried in this order (best first); min_vram_gb = total VRAM across all visible GPUs
-    # Best quality: dense 27B, top open-model coding scores at this size (19.8 GB file)
-    "qwen38_27b":     dict(repo="unsloth/Qwen3.8-27B-GGUF",                  quant="UD-Q5_K_M", ctx=32768, min_vram_gb=26),
-    # Fast MoE (3B active per token): several times quicker on T4s, slightly lower quality (22.1 GB)
-    "qwen36_35b_a3b": dict(repo="unsloth/Qwen3.6-35B-A3B-GGUF",              quant="UD-Q4_K_M", ctx=32768, min_vram_gb=26),
-    # The same 27B at 4-bit, in case the 5-bit build runs out of memory (16.5 GB)
-    "qwen38_27b_q4":  dict(repo="unsloth/Qwen3.8-27B-GGUF",                  quant="UD-Q4_K_M", ctx=32768, min_vram_gb=22),
-    # Older models, known to work with this script
-    "coder30b":       dict(repo="unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF", quant="Q4_K_M", ctx=32768, min_vram_gb=26),
-    "qwen35_27b":     dict(repo="unsloth/Qwen3.5-27B-GGUF",                  quant="Q4_K_M", ctx=16384, min_vram_gb=24),
-    "coder32b_dense": dict(repo="unsloth/Qwen2.5-Coder-32B-Instruct-GGUF",   quant="Q4_K_M", ctx=32768, min_vram_gb=26),
-    "coder14b_dense": dict(repo="unsloth/Qwen2.5-Coder-14B-Instruct-GGUF",   quant="Q4_K_M", ctx=32768, min_vram_gb=12),
+    # Fast MoE Coder: 3B active parameters, ~40-60 tok/s on T4s, purpose-built for agentic coding and tools
+    "coder30b":       dict(repo="unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF", quant="Q4_K_M", ctx=65536, min_vram_gb=24),
+    # Flagship dense coder: highest accuracy and code reasoning depth
+    "coder32b_dense": dict(repo="unsloth/Qwen2.5-Coder-32B-Instruct-GGUF",   quant="Q4_K_M", ctx=65536, min_vram_gb=26),
+    # High-performance 27B at 4-bit with 64k context in VRAM (16.5 GB file)
+    "qwen38_27b_q4":  dict(repo="unsloth/Qwen3.8-27B-GGUF",                  quant="UD-Q4_K_M", ctx=65536, min_vram_gb=22),
+    # Dense coder for smaller VRAM setups
+    "coder14b_dense": dict(repo="unsloth/Qwen2.5-Coder-14B-Instruct-GGUF",   quant="Q4_K_M", ctx=65536, min_vram_gb=12),
     "qwen35_9b":      dict(repo="unsloth/Qwen3.5-9B-GGUF",                   quant="Q4_K_M", ctx=16384, min_vram_gb=10),
 }
 # ---------------------------------------------------------------------------------
@@ -353,6 +351,8 @@ def start_server(model_path, ctx, repo):
     cmd = [SERVER_BIN, "-m", model_path, "-ngl", "99", "-c", str(ctx),
            "--host", "127.0.0.1", "--port", str(PORT),
            "--api-key", API_KEY, "--alias", "qwen"]
+    if KV_CACHE_QUANT and KV_CACHE_QUANT != "f16":
+        cmd += ["-ctk", KV_CACHE_QUANT, "-ctv", KV_CACHE_QUANT]
     if re.search(r"Qwen3\.\d", repo) and not THINKING:   # Qwen3.5/3.6/3.8 can think; Qwen3-Coder can't
         cmd += ["--chat-template-kwargs", json.dumps({"enable_thinking": False})]
     env = server_env(SERVER_BIN)

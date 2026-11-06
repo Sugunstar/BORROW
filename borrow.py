@@ -16,6 +16,8 @@ __version__ = "0.1.3"
 CONFIG_PATH = Path.home() / ".borrow.json"
 LEGACY_CONFIG_PATH = Path.home() / ".qwen_cli.json"   # older versions saved here
 HISTORY_PATH = Path.home() / ".borrow_history"
+SESSION_DIR = ".borrow"
+SESSION_FILE = "session.json"
 KAGGLE_DEFAULT = "https://www.kaggle.com/code"   # opened when no notebook is saved (see /notebook)
 SERVER_SCRIPT_URL = "https://raw.githubusercontent.com/Sugunstar/BORROW/main/qwen_serv.py"
 UA = {"User-Agent": "curl/8.5.0"}
@@ -132,6 +134,17 @@ COMMANDS = {
     "compact": dict(desc="Summarize the conversation to free up context (also runs automatically at 80%)",
                     usage="/compact [what to focus on]", mode=None, needs=None, flags=[],
                     example="/compact keep the details of the auth bug"),
+    "autocompact": dict(desc="Toggle or view auto-compaction when reaching context window threshold",
+                        usage="/autocompact [on|off]", mode=None, needs=None, flags=[],
+                        example="/autocompact on"),
+    "context": dict(desc="Set or show context window size (MAX or a token limit)",
+                    usage="/context [MAX|<number>]", mode=None, needs=None, flags=[],
+                    example="/context MAX"),
+    "ctx":     dict(desc="Alias for /context", usage="/ctx [MAX|<number>]", mode=None, needs=None, flags=[],
+                    example="/ctx 8192"),
+    "session": dict(desc="Toggle or view folder-level session persistence and auto-save",
+                    usage="/session [on|off]", mode=None, needs=None, flags=[],
+                    example="/session on"),
     "clear":   dict(desc="Forget the conversation so far", usage="/clear", mode=None, needs=None, flags=[],
                     example="/clear"),
     "connect": dict(desc="Set or show the endpoint (saved for next time)", usage="/connect [<url> <key>]", mode=None,
@@ -149,8 +162,9 @@ FLAG_DEST = {"-o": ("out", True), "-t": ("temp", True), "-m": ("max_tokens", Tru
              "--run": ("run", True), "--staged": ("staged", False)}
 
 STATE = {"url": "", "key": "", "history": [], "piped": "", "auto_approve": False,
-         "online": None, "model": "", "n_ctx": 0, "ctx_used": 0, "tps": 0, "thought": "",
-         "tok_in": 0, "tok_out": 0}
+         "online": None, "model": "", "n_ctx": 0, "server_n_ctx": 0, "ctx_used": 0, "tps": 0, "thought": "",
+         "tok_in": 0, "tok_out": 0, "session_enabled": True, "autocompact_enabled": True,
+         "context_limit": "MAX"}
 THINK_WORDS = ["Pondering", "Brewing", "Noodling", "Cogitating", "Mulling", "Percolating", "Untangling",
                "Conjuring", "Tinkering", "Ruminating", "Hatching", "Wrangling", "Simmering", "Scheming",
                "Musing", "Unraveling", "Distilling", "Deliberating", "Marinating", "Spelunking"]
@@ -326,6 +340,85 @@ def save_config():
             pass
 
 
+def get_session_path():
+    """Return the Path to the current folder's session file (.borrow/session.json)."""
+    return Path.cwd() / SESSION_DIR / SESSION_FILE
+
+
+def effective_n_ctx():
+    """Return effective context window limit in tokens."""
+    lim = STATE.get("context_limit", "MAX")
+    server_max = STATE.get("server_n_ctx") or 0
+    if isinstance(lim, str) and lim.upper() == "MAX":
+        return server_max or STATE.get("n_ctx") or 0
+    try:
+        val = int(lim)
+        return val if val > 0 else (server_max or STATE.get("n_ctx") or 0)
+    except (ValueError, TypeError):
+        return server_max or STATE.get("n_ctx") or 0
+
+
+def load_session():
+    """Load persistent session state from the current workspace folder if enabled."""
+    if not STATE.get("session_enabled", True):
+        return
+    p = get_session_path()
+    if not p.is_file():
+        return
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            if "history" in data and isinstance(data["history"], list):
+                STATE["history"] = data["history"]
+            if "ctx_used" in data and isinstance(data["ctx_used"], (int, float)):
+                STATE["ctx_used"] = int(data["ctx_used"])
+            if "context_limit" in data:
+                STATE["context_limit"] = data["context_limit"]
+            if "autocompact_enabled" in data:
+                STATE["autocompact_enabled"] = bool(data["autocompact_enabled"])
+            if "session_enabled" in data:
+                STATE["session_enabled"] = bool(data["session_enabled"])
+            if STATE.get("server_n_ctx") or STATE.get("context_limit") != "MAX":
+                STATE["n_ctx"] = effective_n_ctx()
+    except Exception:
+        pass
+
+
+def save_session():
+    """Save persistent session state to the current workspace folder if enabled."""
+    if not STATE.get("session_enabled", True):
+        return
+    p = get_session_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "version": __version__,
+            "updated_at": time.time(),
+            "history": STATE.get("history", []),
+            "ctx_used": STATE.get("ctx_used", 0),
+            "session_enabled": STATE.get("session_enabled", True),
+            "autocompact_enabled": STATE.get("autocompact_enabled", True),
+            "context_limit": STATE.get("context_limit", "MAX"),
+        }
+        tmp = p.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        tmp.replace(p)
+    except Exception:
+        pass
+
+
+def clear_session():
+    """Remove the folder-level session file if it exists."""
+    p = get_session_path()
+    try:
+        if p.is_file():
+            p.unlink()
+    except Exception:
+        pass
+
+
 def health():
     if not STATE["url"]:
         return False
@@ -346,7 +439,7 @@ def pretty_model(name):
 
 def fetch_server_info():
     """Fill STATE with reachability, model name and context size. Runs in a background thread at startup."""
-    STATE.update(online=None, model="", n_ctx=0)
+    STATE.update(online=None, model="", n_ctx=effective_n_ctx())
     STATE["online"] = health()
     if not STATE["online"]:
         return
@@ -356,7 +449,9 @@ def fetch_server_info():
             with urllib.request.urlopen(urllib.request.Request(STATE["url"] + path, headers=headers), timeout=10) as r:
                 data = json.loads(r.read().decode("utf-8", "replace"))
             if path == "/props":
-                STATE["n_ctx"] = (data.get("default_generation_settings") or {}).get("n_ctx") or data.get("n_ctx") or 0
+                server_n = (data.get("default_generation_settings") or {}).get("n_ctx") or data.get("n_ctx") or 0
+                STATE["server_n_ctx"] = server_n
+                STATE["n_ctx"] = effective_n_ctx() or server_n
                 name = data.get("model_path") or ""
             else:
                 name = (data.get("data") or [{}])[0].get("id") or ""
@@ -406,7 +501,20 @@ def stream_chat(messages, temp, max_tokens, top_p=0.8, top_k=20, repeat_penalty=
 
     spinner.start()
     try:
-        with urllib.request.urlopen(req, timeout=600) as r:
+        r = None
+        for attempt in range(2):
+            try:
+                r = urllib.request.urlopen(req, timeout=600)
+                break
+            except urllib.error.HTTPError:
+                raise
+            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+                if attempt == 0:
+                    spinner.update("Network blip, retrying once…")
+                    time.sleep(1)
+                    continue
+                raise
+        with r:
             try:
                 for raw in r:
                     line = raw.decode("utf-8", "replace").strip()
@@ -533,6 +641,7 @@ def compact(focus="", reason=""):
     STATE["history"] = [{"role": "user", "content": "Summary of our conversation so far:\n" + summary},
                         {"role": "assistant", "content": "Understood. I'll continue from this summary."}] + keep
     STATE["ctx_used"] = sum(len(m["content"]) for m in STATE["history"]) // 4    # rough until the next reply
+    save_session()
     print(gold("◇ ") + dim(f"Compacted {len(old)} messages into a summary{reason} · "
                            f"~{fmt_k(before)} → ~{fmt_k(STATE['ctx_used'])} tokens"))
     return True
@@ -540,6 +649,9 @@ def compact(focus="", reason=""):
 
 def maybe_compact(extra_chars=0):
     """Auto-compact before a call when the context window (or our character budget) is nearly full."""
+    if not STATE.get("autocompact_enabled", True):
+        trim_history(extra_chars)
+        return
     n, used = STATE.get("n_ctx") or 0, STATE.get("ctx_used") or 0
     chars = sum(len(m["content"]) for m in STATE["history"]) + extra_chars
     # > 4 messages: right after compacting there are 4 (summary pair + last exchange); don't re-summarize those
@@ -605,6 +717,7 @@ def ask(mode, content, temp=0.2, max_tokens=DEFAULT_MAX_TOKENS, silent=False, st
         print_footer(t0, (mode or "chat").capitalize())
     STATE["history"] += [{"role": "user", "content": content}, {"role": "assistant", "content": text}]
     trim_history()
+    save_session()
     return text
 
 
@@ -997,6 +1110,34 @@ def is_pure_greeting(text):
     return cleaned in greetings
 
 
+def extract_text_tool_calls(text):
+    """Fallback parser for models that output tool calls in plain text or <tool_call> tags."""
+    if not text:
+        return []
+    calls = []
+    # Match <tool_call>...</tool_call>
+    for m in re.finditer(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", text, re.DOTALL):
+        try:
+            raw = m.group(1).strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"^```(?:json)?\s*", "", raw)
+                raw = re.sub(r"\s*```$", "", raw)
+            data = json.loads(raw)
+            if isinstance(data, dict) and "name" in data:
+                fn_name = data["name"]
+                args = data.get("arguments", {})
+                if not isinstance(args, str):
+                    args = json.dumps(args)
+                calls.append({
+                    "id": f"call_{secrets.token_hex(4)}",
+                    "type": "function",
+                    "function": {"name": fn_name, "arguments": args}
+                })
+        except Exception:
+            continue
+    return calls
+
+
 def run_agent(prompt, auto_approve=False, max_turns=12):
     """Autonomous agent loop supporting tool calling, file reading, editing, and commands."""
     maybe_compact(extra_chars=len(prompt))
@@ -1014,7 +1155,8 @@ def run_agent(prompt, auto_approve=False, max_turns=12):
         "   - To modify existing code, use `edit_file` with the exact target text and replacement.\n"
         "   - Only use `write_file` for brand new files or full rewrites.\n"
         "   - Verify your work with `run_command` when appropriate.\n"
-        "   - Be concise and explain what you did when done.\n\n"
+        "   - Be concise and explain what you did when done.\n"
+        "5. ACT IMMEDIATELY: Do not spend turns pondering or outputting long internal monologues about what you plan to do. Execute the appropriate tool call immediately in this step.\n\n"
         f"Workspace Directory: {Path.cwd()}\n"
         f"Workspace Files:\n{ws_tree}\n"
     )
@@ -1036,6 +1178,11 @@ def run_agent(prompt, auto_approve=False, max_turns=12):
         text, finish, tool_calls = res[0], res[1], res[2] if len(res) > 2 else []
         failed = text is None                   # the error is already printed
         use_tools = TOOLS
+
+        if not tool_calls:
+            tool_calls = extract_text_tool_calls(text or "") or extract_text_tool_calls(STATE.get("thought", ""))
+            if tool_calls and "<tool_call>" in (text or ""):
+                text = re.sub(r"<tool_call>.*?(?:</tool_call>|$)", "", text, flags=re.DOTALL).strip()
 
         if text:
             final_text += text
@@ -1077,6 +1224,16 @@ def run_agent(prompt, auto_approve=False, max_turns=12):
         STATE["history"].append({"role": "user", "content": prompt})
         STATE["history"].append({"role": "assistant", "content": final_text})
         trim_history()
+        save_session()
+    elif failed:
+        executed = [tc.get("function", {}).get("name") for m in messages if m.get("role") == "assistant" for tc in m.get("tool_calls", [])]
+        note = f"[Interrupted while working on: {prompt}]"
+        if executed:
+            note += f" (Ran tools: {', '.join(executed)})"
+        STATE["history"].append({"role": "user", "content": prompt})
+        STATE["history"].append({"role": "assistant", "content": note})
+        trim_history()
+        save_session()
     if not failed:
         print_footer(t0, mode_label())
     return final_text
@@ -1221,8 +1378,6 @@ def cmd_help(rest):
 def do_connect(url, key):
     """Save the endpoint and check it. Returns True when the server answers."""
     STATE["url"], STATE["key"] = url.rstrip("/"), key
-    STATE["history"].clear()
-    STATE["ctx_used"] = 0
     save_config()
     fetch_server_info()
     if STATE["online"]:
@@ -1262,7 +1417,77 @@ def cmd_status(rest):
     print(f"{STATE['url']}  ->  " + ("reachable" if STATE["online"] else red("NOT reachable (session ended or URL changed?)")))
     if STATE["model"]:
         print(dim(f"model: {STATE['model']}" + (f" · {fmt_k(STATE['n_ctx'])} context" if STATE["n_ctx"] else "")))
-    print(dim(f"conversation: {len(STATE['history']) // 2} exchanges in memory"))
+    spath = get_session_path()
+    persisted = f" (saved in {spath})" if STATE.get("session_enabled", True) and spath.is_file() else ""
+    print(dim(f"conversation: {len(STATE['history']) // 2} exchanges in memory{persisted}"))
+
+
+def cmd_session(rest):
+    arg = rest.strip().lower()
+    if not arg:
+        status = green("ON") if STATE.get("session_enabled", True) else dim("OFF")
+        spath = get_session_path()
+        ex = f" ({len(STATE.get('history', [])) // 2} exchanges saved at {spath})" if spath.is_file() else f" (target: {spath})"
+        print(f"Session persistence: {status}{ex if STATE.get('session_enabled', True) else ''}")
+        return
+    if arg in ("on", "true", "1", "enable", "enabled"):
+        STATE["session_enabled"] = True
+        save_session()
+        print("Session persistence: " + green("ON") + f" (saving to {get_session_path()})")
+    elif arg in ("off", "false", "0", "disable", "disabled"):
+        STATE["session_enabled"] = False
+        print("Session persistence: " + dim("OFF") + " (in-memory only; won't write to disk)")
+    else:
+        raise UserError("Usage: /session [on|off]")
+
+
+def cmd_autocompact(rest):
+    arg = rest.strip().lower()
+    if not arg:
+        status = green("ON") if STATE.get("autocompact_enabled", True) else dim("OFF")
+        pct = int(COMPACT_AT * 100)
+        print(f"Auto-compaction: {status} (triggers at {pct}% of context window)")
+        return
+    if arg in ("on", "true", "1", "enable", "enabled"):
+        STATE["autocompact_enabled"] = True
+        save_session()
+        print("Auto-compaction: " + green("ON"))
+    elif arg in ("off", "false", "0", "disable", "disabled"):
+        STATE["autocompact_enabled"] = False
+        save_session()
+        print("Auto-compaction: " + dim("OFF"))
+    else:
+        raise UserError("Usage: /autocompact [on|off]")
+
+
+def cmd_context(rest):
+    arg = rest.strip()
+    if not arg:
+        cur = STATE.get("context_limit", "MAX")
+        eff = effective_n_ctx()
+        server = STATE.get("server_n_ctx", 0)
+        used = STATE.get("ctx_used", 0)
+        server_str = f" · server max: {fmt_k(server)}" if server else ""
+        eff_str = f" ({fmt_k(eff)} tokens)" if eff else ""
+        print(f"Context window: {cur}{eff_str}{server_str} · {fmt_k(used)} used")
+        return
+    if arg.upper() == "MAX":
+        STATE["context_limit"] = "MAX"
+        eff = effective_n_ctx()
+        STATE["n_ctx"] = eff
+        save_session()
+        print("Context window set to MAX" + (f" ({fmt_k(eff)} tokens)" if eff else "") + ".")
+    else:
+        try:
+            val = int(arg)
+            if val < 256:
+                raise ValueError()
+        except ValueError:
+            raise UserError("Usage: /context [MAX|<number>]   (e.g. /context MAX or /context 16384)")
+        STATE["context_limit"] = val
+        STATE["n_ctx"] = val
+        save_session()
+        print(f"Context window set to {fmt_k(val)} tokens.")
 
 
 def cmd_think():
@@ -1379,9 +1604,16 @@ def handle(line, raise_errors=False):
                 cmd_help(rest)
             elif name == "compact":
                 compact(focus=rest.strip())
+            elif name == "autocompact":
+                cmd_autocompact(rest)
+            elif name in ("context", "ctx"):
+                cmd_context(rest)
+            elif name == "session":
+                cmd_session(rest)
             elif name == "clear":
                 STATE["history"].clear()
                 STATE.update(ctx_used=0, thought="", show_splash=True)
+                clear_session()
                 print(dim("conversation cleared"))
             elif name == "think":
                 cmd_think()
@@ -2060,7 +2292,9 @@ def repl():
             return
         except Exception as e:                  # a console prompt_toolkit cannot drive
             print(red(f"Connect screen unavailable ({e}). Use /connect <url> <key>."))
-    splash = fancy
+    splash = fancy and not STATE["history"]
+    if STATE["history"]:
+        print(dim(f"Resumed session with {len(STATE['history']) // 2} exchanges in this folder ({get_session_path()})."))
     while True:
         try:
             line = read_input(splash) if fancy else prompt()
@@ -2116,6 +2350,7 @@ def main():
         print_help()
         return
     load_config()
+    load_session()
     if "-y" in args or "--yes" in args:
         STATE["auto_approve"] = True
         args = [a for a in args if a not in ("-y", "--yes")]

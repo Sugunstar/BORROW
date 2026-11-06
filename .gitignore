@@ -56,12 +56,10 @@ tests/regressions/
 # Local credentials, history & runtime state
 .borrow.json
 .borrow_history
+.borrow/
 .qwen_cli.json
 *.borrow_tmp
 *.log
-
-# Scratch / sample files
-landing_page*.html
 
 # IDEs & OS files
 .DS_Store
