@@ -12,7 +12,7 @@ import difflib, json, math, os, random, re, secrets, shlex, shutil, subprocess, 
 import urllib.error, urllib.request
 from pathlib import Path
 
-__version__ = "0.1.4"
+__version__ = "0.1.3"
 CONFIG_PATH = Path.home() / ".borrow.json"
 LEGACY_CONFIG_PATH = Path.home() / ".qwen_cli.json"   # older versions saved here
 HISTORY_PATH = Path.home() / ".borrow_history"
@@ -121,11 +121,6 @@ COMMANDS = {
     "edit":    dict(desc="Ask the agent to edit files or perform tasks in your workspace",
                     usage="/edit <instructions>", mode="edit", needs="text",
                     flags=[F_TEMP, F_MAX], example="/edit fix the bug in utils.py"),
-    "skills":  dict(desc="List all available agent skills", usage="/skills", mode=None,
-                    needs=None, flags=[], example="/skills"),
-    "skill":   dict(desc="Run a skill or scaffold a new one (/skill <name> [prompt], /skill init <name>)",
-                    usage="/skill <name> [prompt]", mode="skill", needs="text",
-                    flags=[F_TEMP, F_MAX], example="/skill qa-tests write tests for borrow.py"),
     "auto":    dict(desc="Toggle auto-approving edits and commands without asking",
                     usage="/auto", mode=None, needs=None, flags=[], example="/auto"),
     "diff":    dict(desc="Show git diff of all workspace changes made so far",
@@ -756,20 +751,6 @@ TOOLS = [
                 "required": ["command"]
             }
         }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "load_skill",
-            "description": "Load the complete instructions, rules, and helper scripts for an agent skill by name.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "The exact name of the skill to load (e.g. qa-review, qa-tests)"}
-                },
-                "required": ["name"]
-            }
-        }
     }
 ]
 
@@ -983,162 +964,7 @@ def execute_tool(name, args, auto_approve=False):
         return tool_search_files(args.get("query", ""), args.get("path", "."))
     elif name == "run_command":
         return tool_run_command(args.get("command", ""), auto_approve)
-    elif name == "load_skill":
-        return tool_load_skill(args.get("name", ""))
     return f"Unknown tool: {name}"
-
-
-# ----------------------------------------------------------------------------- skills system
-def parse_skill_md(file_path):
-    try:
-        p = Path(file_path).resolve()
-        content = p.read_text(encoding="utf-8")
-    except Exception:
-        return None
-
-    name = p.parent.name
-    description = ""
-    body = content
-
-    if content.startswith("---"):
-        parts = content.split("---", 2)
-        if len(parts) >= 3:
-            fm_text = parts[1]
-            body = parts[2].strip()
-            current_key = None
-            desc_lines = []
-            for line in fm_text.splitlines():
-                stripped = line.strip()
-                if not stripped or stripped.startswith("#"):
-                    continue
-                if ":" in line and not line.startswith(" ") and not line.startswith("\t"):
-                    k, _, v = line.partition(":")
-                    k = k.strip().lower()
-                    v = v.strip().strip("\"'")
-                    current_key = k
-                    if k == "name" and v:
-                        name = v
-                    elif k == "description":
-                        if v:
-                            desc_lines.append(v)
-                elif current_key == "description":
-                    desc_lines.append(stripped.strip("\"'"))
-            if desc_lines:
-                description = " ".join(desc_lines)
-
-    if not description:
-        for line in body.splitlines():
-            line = line.strip()
-            if line.startswith("#"):
-                description = line.lstrip("#").strip()
-                break
-            elif line:
-                description = line[:100]
-                break
-
-    return {
-        "name": name,
-        "description": description or f"Skill: {name}",
-        "path": p,
-        "dir": p.parent,
-        "body": body,
-        "raw": content,
-    }
-
-
-def discover_skills(cwd=None):
-    root = Path(cwd).resolve() if cwd else Path.cwd().resolve()
-    skills = {}
-
-    search_dirs = [
-        (Path.home() / ".borrow" / "skills", "global"),
-        (Path.home() / ".agents" / "skills", "global"),
-        (root / ".borrow" / "skills", "workspace"),
-        (root / ".agents" / "skills", "workspace"),
-        (root / "skills", "workspace"),
-    ]
-
-    for base_dir, scope in search_dirs:
-        if not base_dir.is_dir():
-            continue
-        try:
-            for item in sorted(base_dir.iterdir()):
-                skill_md = None
-                if item.is_dir():
-                    candidate = item / "SKILL.md"
-                    if candidate.is_file():
-                        skill_md = candidate
-                elif item.name == "SKILL.md":
-                    skill_md = item
-
-                if skill_md:
-                    parsed = parse_skill_md(skill_md)
-                    if parsed:
-                        parsed["scope"] = scope
-                        skills[parsed["name"]] = parsed
-        except OSError:
-            continue
-
-    return skills
-
-
-def get_skills_prompt(cwd=None):
-    skills = discover_skills(cwd)
-    if not skills:
-        return ""
-    lines = ["Available specialized skills:"]
-    for name, s in sorted(skills.items()):
-        scope_lbl = f"[{s['scope']}]"
-        desc = s["description"]
-        path = s["path"]
-        lines.append(f"- {name} {scope_lbl} ({path}): {desc}")
-    lines.append(
-        "When a user request matches an available skill, call the `load_skill` tool "
-        "(or read its SKILL.md) to follow its specific workflow and instructions."
-    )
-    return "\n".join(lines)
-
-
-def tool_load_skill(name):
-    name = (name or "").strip()
-    if not name:
-        return "Error: Skill name cannot be empty."
-    if ".." in name or "/" in name or "\\" in name:
-        return f"Error: Invalid skill name '{name}'."
-
-    skills = discover_skills()
-    if name not in skills:
-        avail = ", ".join(sorted(skills.keys())) if skills else "none"
-        return f"Error: Skill '{name}' not found. Available skills: {avail}"
-
-    skill = skills[name]
-    output = [
-        f"=== Skill: {skill['name']} ({skill['scope']}) ===",
-        f"Path: {skill['path']}",
-        f"Description: {skill['description']}",
-        "",
-        "--- Instructions (SKILL.md) ---",
-        skill["body"] or "(No instruction body)",
-    ]
-
-    s_dir = skill["dir"]
-    subdirs = ["scripts", "references", "examples"]
-    found_assets = []
-    for sub in subdirs:
-        sub_p = s_dir / sub
-        if sub_p.is_dir():
-            try:
-                entries = [f.name for f in sub_p.iterdir() if f.is_file()]
-                if entries:
-                    found_assets.append(f"  {sub}/: {', '.join(sorted(entries))}")
-            except OSError:
-                pass
-
-    if found_assets:
-        output.append("\n--- Skill Assets ---")
-        output.extend(found_assets)
-
-    return "\n".join(output)
 
 
 def get_workspace_summary(max_files=60):
@@ -1175,25 +1001,22 @@ def run_agent(prompt, auto_approve=False, max_turns=12):
     """Autonomous agent loop supporting tool calling, file reading, editing, and commands."""
     maybe_compact(extra_chars=len(prompt))
     ws_tree = get_workspace_summary()
-    skills_prompt = get_skills_prompt()
     system_prompt = (
         BASE + "\n\n"
         "You are an autonomous pair-programming agent running in the user's terminal workspace (like Claude Code or agy).\n"
-        "You have tools to inspect files, make direct in-place edits, write new files, search, run commands, and load skills.\n\n"
+        "You have tools to inspect files, make direct in-place edits, write new files, search, and run commands.\n\n"
         "CRITICAL BEHAVIOR RULES:\n"
         "1. ONLY use tools when the user's request requires interacting with files, code, or the terminal.\n"
         "2. NEVER proactively call tools (such as list_directory, read_file, or write_file) for greetings (e.g. 'hi', 'hello'), general conversation, or conceptual questions. Just respond politely and ask how you can help.\n"
         "3. NEVER create files or edit code unless the user explicitly requested you to build, change, or create something.\n"
-        "4. When a user request matches an available skill, call `load_skill` to follow its detailed instructions.\n"
-        "5. When the user DOES ask to modify, fix, or inspect code:\n"
+        "4. When the user DOES ask to modify, fix, or inspect code:\n"
         "   - First read the file with `read_file` or search with `search_files`.\n"
         "   - To modify existing code, use `edit_file` with the exact target text and replacement.\n"
         "   - Only use `write_file` for brand new files or full rewrites.\n"
         "   - Verify your work with `run_command` when appropriate.\n"
         "   - Be concise and explain what you did when done.\n\n"
-        + (f"{skills_prompt}\n\n" if skills_prompt else "")
-        + f"Workspace Directory: {Path.cwd()}\n"
-        + f"Workspace Files:\n{ws_tree}\n"
+        f"Workspace Directory: {Path.cwd()}\n"
+        f"Workspace Files:\n{ws_tree}\n"
     )
     messages = [
         {"role": "system", "content": system_prompt},
@@ -1538,96 +1361,6 @@ def cmd_revert(rest):
         print(green(f"✔ Reverted {target}") if code == 0 else red(f"Revert failed: {out}"))
 
 
-def cmd_skills(rest=""):
-    if rest and rest.strip() in ("-h", "--help"):
-        print_help("skills")
-        return
-    skills = discover_skills()
-    if not skills:
-        print(dim("No skills found. Create one with: /skill init <name>"))
-        return
-    print(bold(f"Available Skills ({len(skills)} found):"))
-    for name, s in sorted(skills.items()):
-        scope = cyan(f"[{s['scope']}]")
-        print(f"\n  {bold(name)} {scope}")
-        print(f"    {s['description']}")
-        print(dim(f"    Path: {s['path']}"))
-    print(dim("\nUse /skill <name> [prompt] to run a skill, or /skill init <name> to create one."))
-
-
-def cmd_skill_init(name):
-    name = (name or "").strip()
-    if not name or not re.match(r"^[a-zA-Z0-9_\-]+$", name):
-        raise UserError("Invalid skill name. Use letters, numbers, hyphens, and underscores.")
-    dest_dir = Path.cwd() / ".borrow" / "skills" / name
-    skill_file = dest_dir / "SKILL.md"
-    if skill_file.exists():
-        raise UserError(f"Skill already exists at {skill_file}")
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    template = f"""---
-name: {name}
-description: Brief description of what {name} does and when to use it.
----
-
-# {name.title()} Skill
-
-## When to use
-Describe situations or prompts where this skill applies.
-
-## Instructions
-1. Step-by-step instructions for the agent.
-2. Tools to run or commands to execute.
-
-## Checklist
-- [ ] Task completed
-- [ ] Verified with tests
-"""
-    skill_file.write_text(template, encoding="utf-8")
-    print(green(f"✔ Created skill '{name}' at {skill_file}"))
-    print(dim("Edit the file to add instructions, or run with: ") + f"/skill {name} <prompt>")
-
-
-def cmd_skill(args):
-    if args.get("help"):
-        print_help("skill")
-        return
-    text = args.get("text", "").strip()
-    if not text:
-        raise UserError("Usage: /skill <name> [prompt]  or  /skill init <name>")
-    if text.startswith("init "):
-        cmd_skill_init(text[5:].strip())
-        return
-    parts = text.split(None, 1)
-    sname = parts[0]
-    prompt = parts[1] if len(parts) > 1 else ""
-
-    skills = discover_skills()
-    if sname not in skills:
-        close = difflib.get_close_matches(sname, skills.keys(), n=1)
-        hint = f" Did you mean '{close[0]}'?" if close else ""
-        avail = ", ".join(sorted(skills.keys())) if skills else "none"
-        raise UserError(f"Skill '{sname}' not found.{hint} Available skills: {avail}")
-
-    skill = skills[sname]
-    if not prompt and not args.get("files"):
-        print(bold(f"Skill: {skill['name']} ") + cyan(f"[{skill['scope']}]"))
-        print(dim(f"Path: {skill['path']}"))
-        print(f"Description: {skill['description']}\n")
-        print(skill["body"])
-        return
-
-    extra_instructions = [
-        f"[Skill Activated: {skill['name']}]\n"
-        f"Description: {skill['description']}\n"
-        f"Instructions:\n{skill['body']}"
-    ]
-    args_copy = dict(args)
-    args_copy["text"] = prompt
-    content = build_content(args_copy, extra=extra_instructions)
-    print(bold(f"⚡ Running with skill {cyan(skill['name'])}..."))
-    run_agent(content, auto_approve=STATE.get("auto_approve"))
-
-
 def handle(line, raise_errors=False):
     """Run one input line. Returns False when the user wants to quit."""
     line = line.strip()
@@ -1666,11 +1399,6 @@ def handle(line, raise_errors=False):
                 cmd_diff()
             elif name == "revert":
                 cmd_revert(rest)
-            elif name == "skills":
-                cmd_skills(rest)
-            elif name == "skill":
-                args = parse_args(name, rest)
-                cmd_skill(args)
             elif name == "edit":
                 args = parse_args(name, rest)
                 run_agent(args["text"], auto_approve=STATE.get("auto_approve"))
@@ -1727,18 +1455,6 @@ def make_completer():
                     f = flag.split()[0]
                     if f.startswith(token):
                         yield Completion(f + " ", start_position=-len(token), display=flag, display_meta=d)
-            elif text.startswith("/skill "):
-                parts = text.split()
-                if len(parts) == 1 or (len(parts) == 2 and not text.endswith(" ")):
-                    try:
-                        s_dict = discover_skills()
-                        prefix = parts[1] if len(parts) == 2 else ""
-                        for sname, sinfo in s_dict.items():
-                            if sname.startswith(prefix):
-                                yield Completion(sname + " ", start_position=-len(prefix),
-                                                 display=sname, display_meta=sinfo.get("description", "")[:50])
-                    except Exception:
-                        pass
 
         def paths(self, token):
             raw = os.path.expanduser(token[1:])
