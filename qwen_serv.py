@@ -8,12 +8,12 @@ HOW TO USE
        - Internet: On             (needs a phone-verified Kaggle account)
   2. Paste this ENTIRE file into ONE code cell and run it.
   3. First run takes ~15-25 min (build + ~19 GB download). When ready it prints the URL and
-     key. Paste the connection code it prints into `borrow` on your own computer.
+     key. Use them on your own computer (for example with `/connect <url> <key>` in `borrow`).
   4. The cell keeps running on purpose (it holds the server open). Stop the cell to shut down.
 
 Every step stops with a clear error and a log tail if it fails.
 """
-import glob, json, os, re, secrets, shutil, socket, subprocess, time
+import glob, json, os, re, secrets, shutil, socket, subprocess, threading, time
 import requests
 
 # ----------------------------- settings you may edit -----------------------------
@@ -165,12 +165,34 @@ def server_env(binary):
     return env
 
 
+def _glibc_version():
+    """Return system glibc version as a tuple, e.g. (2, 35)."""
+    try:
+        out = subprocess.run(["ldd", "--version"], capture_output=True, text=True).stdout
+        m = re.search(r"(\d+)\.(\d+)", out.split("\n")[0])
+        if m:
+            return (int(m.group(1)), int(m.group(2)))
+    except Exception:
+        pass
+    return (0, 0)
+
+
 def try_download_prebuilt_llama():
     """Attempt to fetch an official prebuilt CUDA-enabled llama-server binary from GitHub releases.
     Saves 10-15 minutes of compilation time."""
     global SERVER_BIN
+
+    # --- Quick glibc check: latest prebuilt binaries need glibc >= 2.38 (Ubuntu 24.04+).
+    #     Kaggle runs Ubuntu 22.04 (glibc 2.35) so the latest builds will NEVER work.
+    #     Look for older releases that ship an ubuntu-22.04 build instead. ---
+    glibc = _glibc_version()
+    print(f"  System glibc: {glibc[0]}.{glibc[1]}")
+    need_old_ubuntu = glibc < (2, 38)
+
     try:
-        url = "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=5"
+        # Fetch more releases when we need an older compatible build
+        per_page = 30 if need_old_ubuntu else 5
+        url = f"https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page={per_page}"
         req = requests.get(url, headers=UA, timeout=10)
         if req.status_code != 200:
             return False
@@ -179,12 +201,24 @@ def try_download_prebuilt_llama():
         for rel in releases:
             for a in rel.get("assets", []):
                 name = a["name"].lower()
-                if "ubuntu" in name and "cuda" in name and "x64" in name and name.endswith(".tar.gz") and not name.startswith("cudart-"):
-                    asset_url = a["browser_download_url"]
-                    break
+                if not (name.endswith(".tar.gz") and "cuda" in name and "x64" in name
+                        and not name.startswith("cudart-")):
+                    continue
+                if need_old_ubuntu:
+                    # Only accept builds explicitly tagged for Ubuntu 22.04
+                    if "22.04" in name or "ubuntu-22" in name:
+                        asset_url = a["browser_download_url"]
+                        break
+                else:
+                    if "ubuntu" in name:
+                        asset_url = a["browser_download_url"]
+                        break
             if asset_url:
                 break
+
         if not asset_url:
+            reason = f"no build compatible with glibc {glibc[0]}.{glibc[1]}" if need_old_ubuntu else "no CUDA binary found"
+            print(f"  Prebuilt binary skipped ({reason}), will compile from source.")
             return False
 
         print(f"  Downloading prebuilt llama-server ({asset_url.split('/')[-1]})...")
@@ -249,19 +283,36 @@ def build_llama_cpp(arch):
     if SERVER_BIN and os.path.exists(SERVER_BIN):
         print("llama-server already built, skipping.")
         return
+    # Check for existing binary in mounted Kaggle dataset or working dir
+    for input_dir in ("/kaggle/input", "/kaggle/working"):
+        if os.path.isdir(input_dir):
+            for root, _, files in os.walk(input_dir):
+                if "llama-server" in files:
+                    cand = os.path.join(root, "llama-server")
+                    os.chmod(cand, 0o755)
+                    ok, out = cuda_check(cand)
+                    if ok:
+                        SERVER_BIN = cand
+                        print(f"Using pre-built llama-server from dataset: {SERVER_BIN} [0s wait!]")
+                        return
+
     nvcc = find_nvcc()
     if not nvcc:
         raise RuntimeError("CUDA compiler (nvcc) not found. Make sure a GPU accelerator is selected.")
     os.environ["CUDACXX"] = nvcc
     os.environ["PATH"] = os.path.dirname(nvcc) + ":" + os.environ["PATH"]
     if not shutil.which("cmake"):
-        sh("pip install -q cmake")
+        sh("pip install -q cmake ninja", quiet=True)
+    elif not shutil.which("ninja"):
+        sh("pip install -q ninja", quiet=True)
+
     src = f"{WORK}/llama.cpp"
     if not os.path.isdir(src):
         sh(f"git clone --depth 1 https://github.com/ggml-org/llama.cpp {src}")
     sh("rm -rf build", cwd=src)
 
-    base_flags = (f"-DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER={nvcc} -DCMAKE_CUDA_ARCHITECTURES='{arch}' "
+    generator = "-G Ninja" if shutil.which("ninja") else ""
+    base_flags = (f"{generator} -DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER={nvcc} -DCMAKE_CUDA_ARCHITECTURES='{arch}' "
                   "-DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DLLAMA_OPENSSL=OFF "
                   "-DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF")
     cfg_log = f"{WORK}/cmake_configure.log"
@@ -284,8 +335,8 @@ def build_llama_cpp(arch):
         print("".join(open(cfg_log).readlines()[-60:]))
         raise RuntimeError(f"cmake configure failed with every option. Full log: {cfg_log}")
 
-    jobs = max(1, min(4, os.cpu_count() or 2))
-    print(f"Compiling with {jobs} jobs (about 10-15 min, this is normal)...")
+    jobs = os.cpu_count() or 4
+    print(f"Compiling with {jobs} jobs (accelerated with Ninja)...")
     sh(f"cmake --build build --config Release -j{jobs} --target llama-server",
        cwd=src, log=f"{WORK}/cmake_build.log", show_progress=True)
     SERVER_BIN = f"{src}/build/bin/llama-server"
@@ -464,9 +515,31 @@ def start_tunnel():
     return url
 
 
+def _preinstall_download_deps():
+    """Install hf-transfer and huggingface_hub early so the download can start immediately."""
+    try:
+        import hf_transfer
+    except ImportError:
+        sh("pip install -q hf-transfer", quiet=True)
+    try:
+        import huggingface_hub
+    except ImportError:
+        sh("pip install -q huggingface_hub", quiet=True)
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+
+
+def _download_cloudflared():
+    """Pre-download the cloudflared binary so tunnel start is instant."""
+    cf = f"{WORK}/cloudflared"
+    if not os.path.exists(cf):
+        sh(f"wget -q -O {cf} https://github.com/cloudflare/cloudflared/releases/latest/download/"
+           f"cloudflared-linux-amd64 && chmod +x {cf}")
+
+
 def main():
     global WORK, SERVER_BIN
-    print("[1/6] Checking internet, GPUs and disk")
+    t_start = time.time()
+    print("[1/5] Checking internet, GPUs and disk")
     check_internet()
     arch, total_vram = check_gpus()
     WORK = pick_workdir()
@@ -474,31 +547,92 @@ def main():
     order = preset_order(total_vram)
     print("Models to try, best first:", " -> ".join(order))
 
-    print("[2/6] Setting up llama.cpp")
-    setup_llama_cpp(arch)
-    for i, key in enumerate(order):             # a model that fails to download, load or answer -> next one
-        preset = PRESETS[key]
-        print(f"[3/6] Downloading model: {key} -> {preset['repo']} ({preset['quant']}), context {preset['ctx']}")
+    first_key = order[0]
+    first_preset = PRESETS[first_key]
+
+    # ---- PARALLEL PHASE: binary + model + cloudflared all at once ----
+    print(f"[2/5] Parallel: llama.cpp + {first_key} download + cloudflared")
+    bin_error = [None]
+    model_path_result = [None]
+    model_error = [None]
+
+    def _task_binary():
         try:
-            model_path = download_model(preset["repo"], preset["quant"])
-            print("[4/6] Starting server")
-            start_server(model_path, preset["ctx"], preset["repo"])
+            setup_llama_cpp(arch)
+        except Exception as e:
+            bin_error[0] = e
+
+    def _task_model():
+        try:
+            _preinstall_download_deps()
+            model_path_result[0] = download_model(first_preset["repo"], first_preset["quant"])
+        except Exception as e:
+            model_error[0] = e
+
+    def _task_cloudflared():
+        try:
+            _download_cloudflared()
+        except Exception:
+            pass  # not fatal; start_tunnel() will retry
+
+    threads = [
+        threading.Thread(target=_task_binary, name="binary-setup"),
+        threading.Thread(target=_task_model, name="model-download"),
+        threading.Thread(target=_task_cloudflared, name="cloudflared"),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    elapsed = time.time() - t_start
+    print(f"  Parallel phase done in {elapsed:.0f}s")
+
+    if bin_error[0]:
+        raise bin_error[0]
+
+    # ---- TRY FIRST MODEL (already downloaded in parallel) ----
+    model_loaded = False
+    if model_path_result[0]:
+        try:
+            print(f"[3/5] Starting server with {first_key}")
+            start_server(model_path_result[0], first_preset["ctx"], first_preset["repo"])
             test_chat(f"http://127.0.0.1:{PORT}")
-            break
+            model_loaded = True
         except GpuError:
             raise
         except Exception as e:
             stop_server()
-            if i == len(order) - 1:
-                raise
-            print(f"\nModel {key} failed: {e}\nFalling back to {order[i + 1]}...\n")
-    print("[5/6] Opening tunnel")
-    public_url = start_tunnel()
-    print("\nPublic URL:", public_url)
-    print("\n--- optional self-test through the tunnel (from inside Kaggle) ---")
-    selftest_tunnel(public_url)
+            print(f"\nModel {first_key} failed to start: {e}")
+    if model_error[0]:
+        print(f"\nModel {first_key} download failed: {model_error[0]}")
 
-    print("[6/6] Connection details")
+    # ---- FALLBACK: try remaining models sequentially ----
+    if not model_loaded:
+        remaining = [k for k in order if k != first_key]
+        for i, key in enumerate(remaining):
+            preset = PRESETS[key]
+            print(f"[3/5] Trying fallback: {key} -> {preset['repo']} ({preset['quant']})")
+            try:
+                model_path = download_model(preset["repo"], preset["quant"])
+                start_server(model_path, preset["ctx"], preset["repo"])
+                test_chat(f"http://127.0.0.1:{PORT}")
+                model_loaded = True
+                break
+            except GpuError:
+                raise
+            except Exception as e:
+                stop_server()
+                if i == len(remaining) - 1:
+                    raise
+                print(f"\nModel {key} failed: {e}\nFalling back...\n")
+
+    # ---- TUNNEL (cloudflared binary already downloaded in parallel) ----
+    print("[4/5] Opening tunnel")
+    public_url = start_tunnel()
+
+    elapsed_total = time.time() - t_start
+    print(f"\n[5/5] Ready in {elapsed_total:.0f}s")
     print("\n" + "=" * 70)
     print(f"URL: {public_url}")
     print(f"KEY: {API_KEY}")
@@ -529,4 +663,4 @@ except Exception as e:
     stop_tunnel()
     stop_server()
     # print instead of re-raising: Jupyter's traceback printer can crash on chained errors
-    print(f"\nFAILED: {e}")
+    print(f"\nFAILED: {e}") 
