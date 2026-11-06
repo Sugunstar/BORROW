@@ -7,7 +7,8 @@ HOW TO USE
        - Accelerator: GPU T4 x2   (needed for the 30B coder model; one GPU runs the small model)
        - Internet: On             (needs a phone-verified Kaggle account)
   2. Paste this ENTIRE file into ONE code cell and run it.
-  3. First run takes ~15-25 min (build + ~19 GB download). When ready it prints the URL and
+  3. Setup installs a prebuilt llama.cpp (~1-2 min; compiles only if that fails) while the ~20 GB
+     model downloads, so the download is what you wait on. When ready it prints the URL and
      key. Use them on your own computer (for example with `/connect <url> <key>` in `borrow`).
   4. The cell keeps running on purpose (it holds the server open). Stop the cell to shut down.
 
@@ -158,88 +159,40 @@ def find_libcuda():
 
 
 def server_env(binary):
-    """Env for llama-server: its own dir (libggml-cuda.so) plus the CUDA runtime libs on the library path."""
+    """Env for llama-server: its own dir (libggml-cuda.so) plus the CUDA runtime libs on the library path.
+    A sibling lib/ (conda prefix) goes before the system CUDA so its newer cuBLAS/cudart win."""
     env = dict(os.environ)
-    dirs = [os.path.dirname(binary)] + glob.glob("/usr/local/cuda/lib64") + glob.glob("/usr/local/nvidia/lib64")
+    bindir = os.path.dirname(binary)
+    dirs = ([bindir] + glob.glob(os.path.join(os.path.dirname(bindir), "lib"))
+            + glob.glob("/usr/local/cuda/lib64") + glob.glob("/usr/local/nvidia/lib64"))
     env["LD_LIBRARY_PATH"] = ":".join(dirs + [env.get("LD_LIBRARY_PATH", "")])
     return env
 
 
-def _glibc_version():
-    """Return system glibc version as a tuple, e.g. (2, 35)."""
-    try:
-        out = subprocess.run(["ldd", "--version"], capture_output=True, text=True).stdout
-        m = re.search(r"(\d+)\.(\d+)", out.split("\n")[0])
-        if m:
-            return (int(m.group(1)), int(m.group(2)))
-    except Exception:
-        pass
-    return (0, 0)
-
-
-def try_download_prebuilt_llama():
-    """Attempt to fetch an official prebuilt CUDA-enabled llama-server binary from GitHub releases.
-    Saves 10-15 minutes of compilation time."""
+def try_prebuilt_llama():
+    """Install llama.cpp's CUDA 12 build from conda-forge (~1-2 min) instead of compiling (~15 min).
+    The GitHub release binaries are built on Ubuntu 24.04 and need glibc 2.39, which Kaggle lacks.
+    conda-forge's build needs only glibc 2.17, includes T4 (sm_75) kernels and brings its own CUDA runtime."""
     global SERVER_BIN
-
-    # --- Quick glibc check: latest prebuilt binaries need glibc >= 2.38 (Ubuntu 24.04+).
-    #     Kaggle runs Ubuntu 22.04 (glibc 2.35) so the latest builds will NEVER work.
-    #     Look for older releases that ship an ubuntu-22.04 build instead. ---
-    glibc = _glibc_version()
-    print(f"  System glibc: {glibc[0]}.{glibc[1]}")
-    need_old_ubuntu = glibc < (2, 38)
-
+    prefix = f"{WORK}/llama-conda"
+    binary = f"{prefix}/bin/llama-server"
     try:
-        # Fetch more releases when we need an older compatible build
-        per_page = 30 if need_old_ubuntu else 5
-        url = f"https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page={per_page}"
-        req = requests.get(url, headers=UA, timeout=10)
-        if req.status_code != 200:
-            return False
-        releases = req.json()
-        asset_url = None
-        for rel in releases:
-            for a in rel.get("assets", []):
-                name = a["name"].lower()
-                if not (name.endswith(".tar.gz") and "cuda" in name and "x64" in name
-                        and not name.startswith("cudart-")):
-                    continue
-                if need_old_ubuntu:
-                    # Only accept builds explicitly tagged for Ubuntu 22.04
-                    if "22.04" in name or "ubuntu-22" in name:
-                        asset_url = a["browser_download_url"]
-                        break
-                else:
-                    if "ubuntu" in name:
-                        asset_url = a["browser_download_url"]
-                        break
-            if asset_url:
-                break
-
-        if not asset_url:
-            reason = f"no build compatible with glibc {glibc[0]}.{glibc[1]}" if need_old_ubuntu else "no CUDA binary found"
-            print(f"  Prebuilt binary skipped ({reason}), will compile from source.")
-            return False
-
-        print(f"  Downloading prebuilt llama-server ({asset_url.split('/')[-1]})...")
-        tar_path = f"{WORK}/llama_prebuilt.tar.gz"
-        sh(f"wget -q -O {tar_path} '{asset_url}'")
-        sh(f"tar -xzf {tar_path} -C {WORK}/")
-
-        # Find the extracted llama-server executable
-        for root, _, files in os.walk(WORK):
-            if "llama-server" in files:
-                cand = os.path.join(root, "llama-server")
-                os.chmod(cand, 0o755)
-                ok, out = cuda_check(cand)
-                if ok:
-                    SERVER_BIN = cand
-                    print(f"  Prebuilt llama-server verified on GPU: {SERVER_BIN}")
-                    return True
-                print("  Prebuilt llama-server cannot see the GPU, compiling instead. It said:\n" + out[-1500:])
-                return False
+        if not os.path.exists(binary):
+            mm = f"{WORK}/micromamba"
+            if not os.path.exists(mm):
+                sh(f"wget -q -O {mm} https://github.com/mamba-org/micromamba-releases/releases/latest/download/"
+                   f"micromamba-linux-64 && chmod +x {mm}", log=f"{WORK}/conda_install.log", quiet=True)
+            print("  Installing prebuilt llama.cpp (CUDA 12) from conda-forge...")
+            sh(f"CONDA_OVERRIDE_CUDA=12 MAMBA_ROOT_PREFIX={WORK}/mamba {mm} create -y -p {prefix} "
+               f"-c conda-forge 'llama.cpp=*=cuda12*'", log=f"{WORK}/conda_install.log", quiet=True)
+        ok, out = cuda_check(binary)
+        if ok:
+            SERVER_BIN = binary
+            print(f"  Prebuilt llama-server verified on GPU: {SERVER_BIN}")
+            return True
+        print("  Prebuilt llama-server cannot see the GPU, compiling instead. It said:\n" + out[-1500:])
     except Exception as e:
-        print(f"  Prebuilt binary attempt skipped ({e}), falling back to compilation.")
+        print(f"  Prebuilt install failed, compiling instead. ({e})")
     return False
 
 
@@ -272,7 +225,7 @@ def setup_llama_cpp(arch):
         print("Existing llama-server cannot see the GPU, rebuilding it. It said:\n" + out[-1500:])
         shutil.rmtree(os.path.dirname(os.path.dirname(SERVER_BIN)), ignore_errors=True)   # its build/ folder
     print("Checking for prebuilt CUDA-accelerated llama-server (fast setup)...")
-    if try_download_prebuilt_llama():
+    if try_prebuilt_llama():
         return
     print("Compiling llama.cpp from source (fallback)...")
     build_llama_cpp(arch)
