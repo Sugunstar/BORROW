@@ -8,7 +8,7 @@ HOW TO USE
        - Internet: On             (needs a phone-verified Kaggle account)
   2. Paste this ENTIRE file into ONE code cell and run it.
   3. First run takes ~15-25 min (build + ~19 GB download). When ready it prints the URL and
-     key. Use them on your own computer (for example with `/connect <url> <key>` in `borrow`).
+     key. Paste the connection code it prints into `borrow` on your own computer.
   4. The cell keeps running on purpose (it holds the server open). Stop the cell to shut down.
 
 Every step stops with a clear error and a log tail if it fails.
@@ -503,8 +503,8 @@ def main():
     print(f"URL: {public_url}")
     print(f"KEY: {API_KEY}")
     print("=" * 70)
-    print("\nIn borrow, connect with:")
-    print(f"  /connect {public_url} {API_KEY}")
+    print("\nConnection code (copy this line and paste it into borrow):")
+    print(f"  {public_url} {API_KEY}")
     print("Keep this cell running. A new session means a new URL and key: run the cell again.")
 
     try:

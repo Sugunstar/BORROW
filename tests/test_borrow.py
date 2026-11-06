@@ -397,3 +397,47 @@ class TestPromptLook(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestConnectBanner(unittest.TestCase):
+    def test_connect_line(self):
+        url = "https://a-b.trycloudflare.com"
+        self.assertEqual(borrow.connect_line(f"  /connect {url} KEY\n"), f"/connect {url} KEY")
+        self.assertEqual(borrow.connect_line(f"{url} KEY"), f"/connect {url} KEY")
+        self.assertIsNone(borrow.connect_line("/connect"))
+        self.assertIsNone(borrow.connect_line(f"{url} KEY extra"))
+        self.assertIsNone(borrow.connect_line("fix the bug in app.py"))
+
+    def test_banner_state(self):
+        with patch.dict(borrow.STATE, url="", online=None, connecting=False, asking_notebook=False, awaiting_paste=False):
+            self.assertEqual(borrow.banner_state(), "offline")
+            borrow.STATE["awaiting_paste"] = True
+            self.assertEqual(borrow.banner_state(), "waiting")
+            borrow.STATE["asking_notebook"] = True
+            self.assertEqual(borrow.banner_state(), "ask")
+            borrow.STATE.update(url="https://x", asking_notebook=False)
+            self.assertEqual(borrow.banner_state(), "checking")
+            borrow.STATE["connecting"] = True
+            self.assertEqual(borrow.banner_state(), "connecting")
+            borrow.STATE.update(connecting=False, online=True)
+            self.assertEqual(borrow.banner_state(), "connected")
+            borrow.STATE["online"] = False
+            self.assertEqual(borrow.banner_state(), "waiting")
+
+    def test_notebook_slug(self):
+        for given in ("zara/borrow-server", " https://www.kaggle.com/code/zara/borrow-server ",
+                      "kaggle.com/code/zara/borrow-server/edit", "https://www.kaggle.com/code/zara/borrow-server/edit/run/1",
+                      "https://www.kaggle.com/code/zara/borrow-server?scriptVersionId=1"):
+            self.assertEqual(borrow.notebook_slug(given), "zara/borrow-server", given)
+        for bad in ("", "borrow-server", "hello there", "https://github.com/zara/borrow"):
+            self.assertIsNone(borrow.notebook_slug(bad), bad)
+        self.assertEqual(borrow.notebook_link("zara/borrow-server"), "https://www.kaggle.com/code/zara/borrow-server/edit")
+        self.assertEqual(borrow.notebook_link(""), borrow.KAGGLE_DEFAULT)
+
+    def test_notebook_command(self):
+        with patch.dict(borrow.STATE, notebook=""), patch.object(borrow, "save_config") as save:
+            borrow.handle("/notebook https://www.kaggle.com/code/zara/borrow-server")
+            self.assertEqual(borrow.STATE["notebook"], "zara/borrow-server")
+            save.assert_called_once()
+            with self.assertRaises(borrow.UserError):
+                borrow.handle("/notebook not-a-notebook", raise_errors=True)

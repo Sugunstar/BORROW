@@ -16,6 +16,8 @@ __version__ = "0.1.3"
 CONFIG_PATH = Path.home() / ".borrow.json"
 LEGACY_CONFIG_PATH = Path.home() / ".qwen_cli.json"   # older versions saved here
 HISTORY_PATH = Path.home() / ".borrow_history"
+KAGGLE_DEFAULT = "https://www.kaggle.com/code"   # opened when no notebook is saved (see /notebook)
+SERVER_SCRIPT_URL = "https://raw.githubusercontent.com/Sugunstar/BORROW/main/qwen_serv.py"
 UA = {"User-Agent": "curl/8.5.0"}
 MAX_FILE_CHARS = 60_000
 DEFAULT_MAX_TOKENS = 8192   # a full response needs far more than 2048 tokens
@@ -134,6 +136,9 @@ COMMANDS = {
                     example="/clear"),
     "connect": dict(desc="Set or show the endpoint (saved for next time)", usage="/connect [<url> <key>]", mode=None,
                     needs=None, flags=[], example="/connect https://xyz.trycloudflare.com YOUR_KEY"),
+    "notebook": dict(desc="Set or show the Kaggle notebook that Connect opens (saved for next time)",
+                     usage="/notebook [<notebook URL>]", mode=None, needs=None, flags=[],
+                     example="/notebook https://www.kaggle.com/code/username/notebook-name"),
     "status":  dict(desc="Check that the server is reachable", usage="/status", mode=None, needs=None, flags=[],
                     example="/status"),
     "help":    dict(desc="Show all commands, their flags and what they do", usage="/help [command]", mode=None,
@@ -282,10 +287,30 @@ def load_config():
             continue
     STATE["url"] = (os.environ.get("ASK_URL") or cfg.get("url", "")).rstrip("/")
     STATE["key"] = os.environ.get("ASK_KEY") or cfg.get("key", "")
+    STATE["notebook"] = notebook_slug(os.environ.get("BORROW_NOTEBOOK") or cfg.get("notebook", "")) or ""
+
+
+def notebook_slug(text):
+    """A Kaggle notebook URL, or just 'username/notebook-name' -> 'username/notebook-name', else None."""
+    m = re.fullmatch(r"\s*(?:(?:https?://)?(?:www\.)?kaggle\.com/code/)?([\w-]+)/([\w-]+)(?:[/?#]\S*)?\s*", text or "")
+    return f"{m[1]}/{m[2]}" if m else None
+
+
+def notebook_link(slug):
+    """Where Connect sends you: the notebook's editor, or Kaggle's notebook list when none is saved."""
+    return f"https://www.kaggle.com/code/{slug}/edit" if slug else KAGGLE_DEFAULT
+
+
+def connect_line(text):
+    """A pasted '/connect <url> <key>' (or just '<url> <key>') -> normalized '/connect <url> <key>', else None."""
+    m = re.fullmatch(r"\s*(?:/connect\s+)?(https?://\S+)\s+(\S+)\s*", text or "")
+    return f"/connect {m[1]} {m[2]}" if m else None
 
 
 def save_config():
-    data = json.dumps({"url": STATE["url"], "key": STATE["key"]}, indent=2)
+    data = json.dumps({"url": STATE["url"], "key": STATE["key"],
+                       **({"notebook": STATE["notebook"]} if STATE.get("notebook") else {})},
+                      indent=2)
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -1193,6 +1218,18 @@ def cmd_help(rest):
     print_help(arg or None)
 
 
+def do_connect(url, key):
+    """Save the endpoint and check it. Returns True when the server answers."""
+    STATE["url"], STATE["key"] = url.rstrip("/"), key
+    STATE["history"].clear()
+    STATE["ctx_used"] = 0
+    save_config()
+    fetch_server_info()
+    if STATE["online"]:
+        STATE["connected_at"] = time.time()     # the connect screen shows "Connected" briefly, then moves on
+    return bool(STATE["online"])
+
+
 def cmd_connect(rest):
     toks = split_line(rest)
     if not toks:
@@ -1201,12 +1238,21 @@ def cmd_connect(rest):
         return
     if len(toks) != 2:
         raise UserError("Usage: /connect <url> <key>")
-    STATE["url"], STATE["key"] = toks[0].rstrip("/"), toks[1]
-    STATE["history"].clear()
-    STATE["ctx_used"] = 0
+    do_connect(toks[0], toks[1])
+    print("saved. " +("server reachable." if STATE["online"] else red("saved, but the server did not answer /health yet.")))
+
+
+def cmd_notebook(rest):
+    if not rest.strip():
+        nb = STATE.get("notebook")
+        print(f"notebook: {nb}  ({notebook_link(nb)})" if nb else f"notebook: (not set, Connect opens {KAGGLE_DEFAULT})")
+        return
+    slug = notebook_slug(rest)
+    if not slug:
+        raise UserError("Usage: /notebook <notebook URL>   (e.g. https://www.kaggle.com/code/username/notebook-name)")
+    STATE.update(notebook=slug, asked_notebook=True, asking_notebook=False)
     save_config()
-    fetch_server_info()
-    print("saved. " + ("server reachable." if STATE["online"] else red("saved, but the server did not answer /health yet.")))
+    print(f"saved {slug}. Connect now opens {notebook_link(slug)}")
 
 
 def cmd_status(rest):
@@ -1341,6 +1387,8 @@ def handle(line, raise_errors=False):
                 cmd_think()
             elif name == "connect":
                 cmd_connect(rest)
+            elif name == "notebook":
+                cmd_notebook(rest)
             elif name == "status":
                 cmd_status(rest)
             elif name == "auto":
@@ -1500,7 +1548,7 @@ TIPS = [("Type ", "@", " to attach a file, Tab completes the path"),
         ("Use ", "/review @file", " for a strict code review, most important issues first"),
         ("Use ", "/clear", " to start a fresh conversation and come back here"),
         ("Pipe input in from your shell: ", "git diff | borrow /review -", "")]
-CONNECT_TIP = ("Paste the ", "/connect <url> <key>", " line that qwen_serv.py prints on Kaggle")
+CONNECT_TIP = ("Paste the ", "connection code", " that qwen_serv.py prints on Kaggle, or use /connect <url> <key>")
 STYLE_RULES = {
     "screen": f"bg:{BG}",
     "box": f"bg:{PANEL} {TEXT}",
@@ -1520,6 +1568,7 @@ STYLE_RULES = {
     "flag": "#d7a7ff",
     "file": "#5fafff underline",
     "good": "#5fd75f",
+    "btn": f"bg:{Y} #000000 bold",
     "warn": "#ffaf00",
     "bad": "#ff5f5f",
     "completion-menu.completion": "bg:#1c1c1c #d0d0d0",
@@ -1566,6 +1615,248 @@ def info_fragments():
     elif n:
         out.append(("class:muted", f"   {fmt_k(n)} context"))
     return out
+
+
+def banner_state():
+    """Which step the connect screen is on."""
+    if STATE.get("connecting"):
+        return "connecting"
+    if STATE["url"] and STATE.get("online"):
+        return "connected"
+    if STATE.get("asking_notebook"):
+        return "ask"
+    if STATE["url"] and STATE.get("online") is None:          # startup check of the saved server
+        return "checking"
+    return "waiting" if STATE.get("awaiting_paste") else "offline"
+
+
+def open_notebook():
+    import webbrowser
+    if not STATE.get("notebook") and not STATE.get("asked_notebook"):
+        STATE["asking_notebook"] = True     # first time: ask which notebook before opening anything
+        return
+    STATE.update(awaiting_paste=True, asking_notebook=False)
+    threading.Thread(target=copy_server_script, daemon=True).start()   # step 2 of the setup: paste it into a cell
+    try:
+        webbrowser.open(notebook_link(STATE.get("notebook")))
+    except Exception:
+        pass
+
+
+def server_script():
+    """qwen_serv.py: the copy next to borrow.py (a git checkout), else the one on GitHub (pip installs only borrow.py)."""
+    local = Path(__file__).with_name("qwen_serv.py")
+    if local.is_file():
+        return local.read_text(encoding="utf-8")
+    with urllib.request.urlopen(urllib.request.Request(SERVER_SCRIPT_URL, headers=UA), timeout=15) as r:
+        return r.read().decode("utf-8")
+
+
+def to_clipboard(text):
+    """Stdlib has no clipboard, so use the OS tool. Returns True on success."""
+    if os.name == "nt":
+        cmds, data = [["clip"]], text.encode("utf-16")      # clip reads UTF-16 (with BOM) correctly
+    else:
+        cmds, data = [["pbcopy"], ["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "-ib"]], text.encode()
+    for cmd in cmds:
+        if shutil.which(cmd[0]):
+            try:
+                return subprocess.run(cmd, input=data, timeout=10).returncode == 0
+            except Exception:
+                continue
+    return False
+
+
+def copy_server_script():
+    STATE["copied"] = None                  # None = working on it
+    try:
+        STATE["copied"] = to_clipboard(server_script())
+    except Exception:
+        STATE["copied"] = False
+
+
+def answer_notebook(text):
+    """The user's reply to 'which notebook?'. Empty = skip. Returns False if it isn't a notebook."""
+    if text.strip():
+        slug = notebook_slug(text)
+        if not slug:
+            STATE["notebook_err"] = True
+            return False
+        STATE["notebook"] = slug
+        save_config()
+    STATE.update(asked_notebook=True, notebook_err=False)
+    open_notebook()
+    return True
+
+
+def banner_fragments():
+    from prompt_toolkit.mouse_events import MouseEventType
+
+    def click(ev):
+        if ev.event_type == MouseEventType.MOUSE_UP:
+            open_notebook()
+    state, host = banner_state(), re.sub(r"^https?://", "", STATE["url"]).split("/")[0]
+    err = [("", "\n\n"), ("class:bad", STATE["connect_err"])] if STATE.get("connect_err") else []
+    spin = Spinner.FRAMES_BRAILLE[int(time.time() * 12) % 10]
+    if state == "checking":
+        return [("class:warn bold", f"{spin} Checking your saved server"), ("", "\n"), ("class:muted", host)]
+    if state == "connecting":
+        return [("class:warn bold", f"{spin} Connecting"), ("", "\n"), ("class:muted", host)]
+    if state == "connected":
+        n = STATE.get("n_ctx")
+        return [("class:good bold", "✔ Connected"), ("", "\n"),
+                ("class:model", STATE.get("model") or host), ("class:muted", f"  ·  {fmt_k(n)} context" if n else ""),
+                ("", "\n"), ("class:muted", "agent ready, opening the prompt…")]
+    if state == "ask":
+        return [("class:warn bold", "? Paste your Kaggle notebook's URL"), ("", "\n\n"),
+                ("class:muted", "It looks like "), ("class:key", "https://www.kaggle.com/code/username/notebook-name"),
+                ("", "\n"), ("class:muted", "No notebook yet? Press enter to open Kaggle, click "),
+                ("class:key", "+ New Notebook"), ("class:muted", ", then use /notebook <url> later.")] + (
+                [("", "\n\n"), ("class:bad", "That isn't a notebook URL. Copy it from your browser's address bar.")]
+                if STATE.get("notebook_err") else [])
+    if state == "waiting":
+        copied = STATE.get("copied")
+
+        def recopy(ev):
+            if ev.event_type == MouseEventType.MOUSE_UP:
+                threading.Thread(target=copy_server_script, daemon=True).start()
+        step2 = ([("class:good", "✔ qwen_serv.py is on your clipboard."), ("class:muted", " Paste it into one code cell, press Run")]
+                 if copied else [("class:muted", f"{spin} Copying qwen_serv.py to your clipboard…")] if copied is None else
+                 [("class:muted", "Copy qwen_serv.py from "), ("class:key", "github.com/Sugunstar/BORROW"),
+                  ("class:muted", ", paste it into one code cell, press Run")])
+        return [("class:warn bold", "◌ Start your server on Kaggle"), ("", "\n\n"),
+                ("class:muted", "1. Sidebar → Session options: "), ("class:key", "Accelerator GPU T4 x2"),
+                ("class:muted", ", "), ("class:key", "Internet On"), ("", "\n"),
+                ("class:muted", "2. ")] + step2 + [("", "\n"),
+                ("class:muted", "3. Wait for the build (about 3-5 min) until the cell prints a "),
+                ("class:key", "connection code"), ("", "\n"),
+                ("class:muted", "4. Copy the code and paste it below. Keep the cell running."), ("", "\n\n"),
+                ("class:btn", " Reopen notebook ↗ ", click), ("class:muted", "   "),
+                ("class:btn", " Copy script again ", recopy)] + err
+    why = "Your saved server isn't answering. The Kaggle session may have ended." if STATE["url"] else \
+          "Borrow runs its model on a free Kaggle notebook. Let's start it."
+    return [("class:bad bold", "● Agent not connected"), ("", "\n\n"), ("class:muted", why), ("", "\n\n"),
+            ("class:btn", " Connect ↗ ", click), ("class:muted", "  enter  ·  opens your Kaggle notebook"), ("", "\n"),
+            ("class:muted", "Already have a connection code? Paste it below.")] + err
+
+
+def connect_screen():
+    """Full-screen logo + connection steps. Returns once connected (or the user skips with Esc).
+    Raises EOFError when the user quits."""
+    from prompt_toolkit.application import Application
+    from prompt_toolkit.buffer import Buffer
+    from prompt_toolkit.filters import Condition
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.keys import Keys
+    from prompt_toolkit.layout import ConditionalContainer, HSplit, Layout, VSplit, Window, WindowAlign
+    from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+    from prompt_toolkit.layout.dimension import Dimension as D
+    from prompt_toolkit.layout.processors import AfterInput, ConditionalProcessor
+    from prompt_toolkit.output import ColorDepth
+    from prompt_toolkit.styles import Style
+
+    buf, kb = Buffer(), KeyBindings()
+    buf.on_cursor_position_changed += lambda _: INPUT.__setitem__("typed", time.time())
+    takes_input = Condition(lambda: banner_state() in ("ask", "offline", "waiting"))
+
+    def start_connect(line):
+        _, url, key = line.split()
+        STATE.update(connecting=True, connect_err="")
+
+        def work():
+            if not do_connect(url, key):
+                STATE.update(awaiting_paste=True, connect_err="That server didn't answer. Is the Kaggle cell "
+                                                              "still running? Paste the newest connection code.")
+            STATE["connecting"] = False
+        threading.Thread(target=work, daemon=True).start()
+
+    def take(text):
+        """Enter or a paste: answer the notebook question, or connect if it's a connection code."""
+        if banner_state() == "ask":
+            return answer_notebook(text)
+        line = connect_line(text)
+        if line:
+            start_connect(line)
+        elif text.strip():
+            STATE["connect_err"] = "That isn't a connection code. It looks like: https://….trycloudflare.com KEY"
+            return False
+        else:
+            STATE["connect_err"] = ""
+            open_notebook()
+        return True
+
+    @kb.add("enter", filter=takes_input)
+    def _enter(e):
+        if take(buf.text):
+            buf.reset()
+
+    @kb.add(Keys.BracketedPaste, filter=takes_input)
+    def _paste(e):
+        text = buf.text + e.data.replace("\r", "\n")
+        if notebook_slug(text) if banner_state() == "ask" else connect_line(text):
+            take(text)
+            buf.reset()
+        else:
+            buf.insert_text(e.data.replace("\r", ""))
+
+    @kb.add("escape")
+    def _skip(e):
+        e.app.exit()
+
+    @kb.add("c-c")
+    @kb.add("c-d")
+    def _quit(e):
+        e.app.exit(exception=EOFError)
+
+    hint = lambda: "paste the notebook URL here" if banner_state() == "ask" else "paste the connection code here"
+    input_row = ConditionalContainer(HSplit([Window(height=1), VSplit([
+        Window(FormattedTextControl([("class:tip", "› ")]), width=2),
+        Window(BufferControl(buf, input_processors=[
+            ConditionalProcessor(AfterInput(hint, style="class:placeholder"), Condition(lambda: not buf.text)),
+            make_caret()]), height=1, always_hide_cursor=True)])]), filter=takes_input)
+    bar = lambda: "fg:" + {"connected": "#5fd75f", "offline": "#ff5f5f"}.get(banner_state(), "#ffaf00")
+    panel = VSplit([
+        Window(width=1, char="┃", style=bar),
+        Window(width=2),
+        HSplit([Window(height=1),
+                Window(FormattedTextControl(banner_fragments), wrap_lines=True, dont_extend_height=True),
+                input_row, Window(height=1)]),
+        Window(width=1),
+    ], style="class:box")
+
+    def hints():
+        out = []
+        for key, label in (("enter", "continue"), ("esc", "skip"), ("ctrl+c", "quit")):
+            out += [("class:key", "   " + key), ("class:muted", " " + label)]
+        return out + [("", " ")]
+    width = lambda: D.exact(max(30, min(78, shutil.get_terminal_size().columns - 4)))
+    body = HSplit([
+        Window(),
+        Window(FormattedTextControl(logo_fragments), height=4, align=WindowAlign.CENTER),
+        Window(height=1),
+        Window(FormattedTextControl([("class:tagline", "brain on remote  ·  run on workstation")]),
+               height=1, align=WindowAlign.CENTER),
+        Window(height=2),
+        VSplit([Window(), HSplit([panel, Window(FormattedTextControl(hints), height=1, align=WindowAlign.RIGHT)],
+                                 width=width), Window()]),
+        Window(),
+        VSplit([Window(FormattedTextControl(status_fragments)),
+                Window(FormattedTextControl([("class:muted", f"borrow {__version__}  ")]), dont_extend_width=True)],
+               height=1),
+    ], style="class:screen")
+    truecolor = os.environ.get("COLORTERM") in ("truecolor", "24bit") or os.environ.get("WT_SESSION")
+    app = Application(layout=Layout(body, focused_element=buf), key_bindings=kb, style=Style.from_dict(STYLE_RULES),
+                      full_screen=True, mouse_support=True, refresh_interval=0.1,
+                      color_depth=ColorDepth.TRUE_COLOR if truecolor else None)
+
+    def leave_when_connected():                 # straight away for a saved server, after 1.5s of "Connected" otherwise
+        while not app.is_done:
+            if banner_state() == "connected" and time.time() - STATE.get("connected_at", 0) > 1.5:
+                app.loop.call_soon_threadsafe(app.exit)
+                return
+            time.sleep(0.1)
+    app.pre_run_callables.append(lambda: threading.Thread(target=leave_when_connected, daemon=True).start())
+    app.run()
 
 
 def hint_fragments():
@@ -1761,6 +2052,14 @@ def repl():
             print(red("Not connected yet. Type /connect <url> <key>  (or set ASK_URL and ASK_KEY)."))
         elif not health():
             print(red("Saved endpoint is not reachable. If you started a new Kaggle session, use /connect with the new URL and key."))
+    if fancy:
+        try:
+            connect_screen()                    # logo + connection steps first; the prompt comes after
+        except EOFError:
+            print(dim("bye"))
+            return
+        except Exception as e:                  # a console prompt_toolkit cannot drive
+            print(red(f"Connect screen unavailable ({e}). Use /connect <url> <key>."))
     splash = fancy
     while True:
         try:

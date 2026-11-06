@@ -64,10 +64,10 @@ Observed performance on Kaggle 2x Tesla T4:
 2. Paste the **entire** contents of `qwen_serv.py` into a single code cell and click **Run**.
 3. Setup fetches prebuilt CUDA-accelerated `llama-server` binaries and runs high-speed downloads, completing in **~3–5 minutes**.
    *(Tip: Mounting the GGUF model as a Kaggle Dataset finishes setup in **~1–2 minutes**).*
-4. Once ready, the cell prints:
+4. Once ready, the cell prints a connection code:
 
    ```
-   /connect https://some-random-words.trycloudflare.com YOUR_KEY
+   https://some-random-words.trycloudflare.com YOUR_KEY
    ```
 
 5. **Leave the cell running.** Stopping the cell shuts down the server.
@@ -100,10 +100,10 @@ Launch the interactive CLI:
 borrow
 ```
 
-Paste your `/connect` line:
+Paste the connection code (or type `/connect <url> <key>`):
 
 ```
-/connect https://some-random-words.trycloudflare.com YOUR_KEY
+https://some-random-words.trycloudflare.com YOUR_KEY
 ```
 
 The CLI saves your credentials to `~/.borrow.json`, verifies the connection, and reports `saved. server reachable.`
@@ -120,7 +120,9 @@ Kaggle sessions are ephemeral. When you start a new Kaggle notebook session, run
 
 ## Using the CLI
 
-Running `borrow` opens a full-screen start page in yellow and black: the **BORROW** logo, a prompt box showing the agent mode, the connected **model** and its **context size**, key hints, a tip, and a status bar (connection, folder, version). After your first message the page clears and the conversation scrolls normally, with the same prompt box under each reply showing how full the context window is (for example `9.8K / 32K context (30%)`).
+If no server is reachable, `borrow` first opens a **connect screen**: the BORROW logo and a panel that walks you through it. Press **Connect** (or Enter) to open your Kaggle notebook (asked once, change it later with `/notebook`), run `qwen_serv.py` there, then paste the connection code it prints. It connects on paste, shows **✔ Connected** and moves on. Esc skips the screen.
+
+Once connected, `borrow` opens a full-screen start page in yellow and black: the **BORROW** logo, a prompt box showing the agent mode, the connected **model** and its **context size**, key hints, a tip, and a status bar (connection, folder, version). After your first message the page clears and the conversation scrolls normally, with the same prompt box under each reply showing how full the context window is (for example `9.8K / 32K context (30%)`).
 
 - **Interactive Autonomous Agent:** Simply type instructions in plain English (e.g. `refactor auth.py to use JWT` or `fix the failing pytest`).
 - Type **`/`** to open the interactive command dropdown menu. Filter by typing and navigate with arrow keys or Tab.
@@ -201,6 +203,7 @@ Prefixing prompts with a command sends specialized system instructions:
 | `/commit` | Generate conventional commit messages from git diff | `--staged` `-o` `-t` |
 | `/shell <what you want>` | Translate natural language into a shell command with confirmation | `-t` |
 | `/connect [<url> <key>]` | Configure or view the active Cloudflare endpoint and API key | |
+| `/notebook [<notebook URL>]` | Set or show the Kaggle notebook the **Connect** button opens | |
 | `/status` | Verify remote server connectivity and model health | |
 | `/think` | Show the model's full reasoning for the last reply | |
 | `/clear` | Reset chat history and return to the start screen | |
