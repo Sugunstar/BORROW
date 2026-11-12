@@ -872,8 +872,38 @@ TOOL_VERBS = {"read_file": ("Read", "path"), "edit_file": ("Edit", "path"), "wri
               "list_directory": ("List", "path"), "search_files": ("Search", "query"), "run_command": ("Run", "command")}
 
 
+def safe_path(path="."):
+    """Validate that path is inside the current workspace folder and not a forbidden file.
+    Refuses anything outside the current folder, and always refuses .env, ~/.ssh, and ~/.borrow.json.
+    Returns the resolved Path, or raises PermissionError if access is refused."""
+    if not path:
+        path = "."
+    cwd = Path.cwd().resolve()
+    p = Path(path).expanduser().resolve()
+
+    # Block any path outside the project folder
+    if p != cwd and not p.is_relative_to(cwd):
+        raise PermissionError(f"Access denied: '{path}' is outside the project folder ({cwd}).")
+
+    # Always refuse ~/.ssh, ~/.borrow.json, and .env
+    ssh_dir = Path("~/.ssh").expanduser().resolve()
+    borrow_cfg = Path("~/.borrow.json").expanduser().resolve()
+
+    if p == ssh_dir or p.is_relative_to(ssh_dir) or ".ssh" in p.parts:
+        raise PermissionError("Access denied: access to ~/.ssh is forbidden.")
+    if p == borrow_cfg or p.name == ".borrow.json":
+        raise PermissionError("Access denied: access to ~/.borrow.json is forbidden.")
+    if p.name == ".env" or p.name.startswith(".env.") or p.name.endswith(".env") or ".env" in p.parts:
+        raise PermissionError("Access denied: access to .env files is forbidden.")
+
+    return p
+
+
 def tool_read_file(path, start_line=1, end_line=None):
-    p = Path(path).expanduser()
+    try:
+        p = safe_path(path)
+    except (PermissionError, ValueError) as e:
+        return f"Error: {e}"
     if p.is_dir():
         return f"Error: {path} is a directory, not a file. Use list_directory instead."
     if not p.is_file():
@@ -904,7 +934,10 @@ def tool_read_file(path, start_line=1, end_line=None):
 
 
 def tool_edit_file(path, target, replacement, auto_approve=False):
-    p = Path(path).expanduser()
+    try:
+        p = safe_path(path)
+    except (PermissionError, ValueError) as e:
+        return f"Error: {e}"
     if not p.is_file():
         return f"Error: File not found: {path}"
     try:
@@ -947,7 +980,10 @@ def tool_edit_file(path, target, replacement, auto_approve=False):
 
 
 def tool_write_file(path, content, auto_approve=False):
-    p = Path(path).expanduser()
+    try:
+        p = safe_path(path)
+    except (PermissionError, ValueError) as e:
+        return f"Error: {e}"
     if p.is_dir():
         return f"Error: {path} is a directory, not a file."
 
@@ -981,7 +1017,10 @@ def tool_write_file(path, content, auto_approve=False):
 
 
 def tool_list_directory(path="."):
-    p = Path(path).expanduser()
+    try:
+        p = safe_path(path)
+    except (PermissionError, ValueError) as e:
+        return f"Error: {e}"
     if not p.is_dir():
         return f"Error: Directory not found: {path}"
     ignored = {".git", "__pycache__", ".venv", ".pytest_cache", "node_modules", "build", "dist", ".qa-venv"}
@@ -992,7 +1031,7 @@ def tool_list_directory(path="."):
 
     results = []
     for e in entries:
-        if e.name in ignored:
+        if e.name in ignored or e.name == ".borrow.json" or e.name == ".env" or e.name.startswith(".env.") or e.name == ".ssh":
             continue
         if e.is_dir():
             results.append(f"  [dir]  {e.name}/")
@@ -1006,7 +1045,10 @@ def tool_list_directory(path="."):
 
 
 def tool_search_files(query, path="."):
-    p = Path(path).expanduser()
+    try:
+        p = safe_path(path)
+    except (PermissionError, ValueError) as e:
+        return f"Error: {e}"
     if not p.is_dir():
         return f"Error: {path} is not a directory"
     ignored = {".git", "__pycache__", ".venv", ".pytest_cache", "node_modules", "build", "dist", ".qa-venv"}
@@ -1019,10 +1061,12 @@ def tool_search_files(query, path="."):
     spinner.start()
     try:
         matches = []
-        cwd = Path.cwd()
+        cwd = Path.cwd().resolve()
         for root, dirs, files in os.walk(p):
-            dirs[:] = [d for d in dirs if d not in ignored]
+            dirs[:] = [d for d in dirs if d not in ignored and d != ".env" and d != ".ssh"]
             for f in sorted(files):
+                if f == ".borrow.json" or f == ".env" or f.startswith(".env.") or f == ".ssh":
+                    continue
                 file_path = Path(root) / f
                 try:
                     with file_path.open("rb") as fp:
@@ -1083,9 +1127,11 @@ def execute_tool(name, args, auto_approve=False):
 def get_workspace_summary(max_files=60):
     ignored = {".git", "__pycache__", ".venv", ".pytest_cache", "node_modules", "build", "dist", ".qa-venv"}
     files_list = []
-    root = Path.cwd()
+    root = Path.cwd().resolve()
     for p in root.rglob("*"):
         if any(part in ignored for part in p.parts):
+            continue
+        if p.name == ".borrow.json" or p.name == ".env" or p.name.startswith(".env.") or ".ssh" in p.parts:
             continue
         if p.is_file():
             try:
@@ -1138,6 +1184,51 @@ def extract_text_tool_calls(text):
     return calls
 
 
+def prune_tool_outputs_if_needed(messages):
+    """Shorten older tool outputs when messages near the context limit to prevent HTTP errors."""
+    n = effective_n_ctx() or STATE.get("n_ctx") or 32768
+    threshold = min(int(n * 0.75), MAX_HISTORY_CHARS // 4)
+
+    def calc_tokens():
+        toks = 0
+        for m in messages:
+            toks += len(str(m.get("content") or "")) // 4
+            if m.get("tool_calls"):
+                toks += len(json.dumps(m["tool_calls"])) // 4
+        return toks
+
+    if calc_tokens() < threshold:
+        return
+
+    tool_indices = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+    if not tool_indices:
+        return
+
+    # Shorten older tool outputs first
+    candidates = tool_indices[:-1] if len(tool_indices) > 1 else tool_indices
+    for idx in candidates:
+        if calc_tokens() < threshold:
+            break
+        m = messages[idx]
+        content = str(m.get("content") or "")
+        if len(content) > 300 and "[... output shortened to save context ...]" not in content:
+            lines = content.splitlines()
+            preview = "\n".join(lines[:3]) if len(lines) > 3 else content[:200]
+            m["content"] = preview + "\n[... output shortened to save context ...]"
+
+    # If still near the limit, shorten remaining tool outputs
+    if calc_tokens() >= threshold:
+        for idx in tool_indices:
+            if calc_tokens() < threshold:
+                break
+            m = messages[idx]
+            content = str(m.get("content") or "")
+            if len(content) > 300 and "[... output shortened to save context ...]" not in content:
+                lines = content.splitlines()
+                preview = "\n".join(lines[:3]) if len(lines) > 3 else content[:200]
+                m["content"] = preview + "\n[... output shortened to save context ...]"
+
+
 def run_agent(prompt, auto_approve=False, max_turns=12):
     """Autonomous agent loop supporting tool calling, file reading, editing, and commands."""
     maybe_compact(extra_chars=len(prompt))
@@ -1171,8 +1262,10 @@ def run_agent(prompt, auto_approve=False, max_turns=12):
     t0, failed = time.time(), False
     STATE.update(thought="", tok_in=0, tok_out=0)
     use_tools = None if is_pure_greeting(prompt) else TOOLS
+    tool_calls = []
     while turns < max_turns:
         turns += 1
+        prune_tool_outputs_if_needed(messages)
         step_lbl = f"Thinking · step {turns}…" if turns > 1 else "Thinking…"
         res = stream_chat(messages, temp=0.2, max_tokens=DEFAULT_MAX_TOKENS, tools=use_tools, status_label=step_lbl)
         text, finish, tool_calls = res[0], res[1], res[2] if len(res) > 2 else []
@@ -1198,27 +1291,49 @@ def run_agent(prompt, auto_approve=False, max_turns=12):
             "tool_calls": tool_calls
         })
 
+        is_cut_off = (finish == "length")
         for tc in tool_calls:
             fn = tc.get("function", {})
             fn_name = fn.get("name", "")
             raw_args = fn.get("arguments", "{}")
             call_id = tc.get("id") or f"call_{secrets.token_hex(4)}"
-            try:
-                args = json.loads(raw_args)
-            except Exception:
-                args = {}
-            if not isinstance(args, dict):
-                args = {}
 
-            verb, key = TOOL_VERBS.get(fn_name, (fn_name, None))
-            arg = str(args.get(key, "")) if key else ", ".join(f"{k}={v!r}" for k, v in args.items())
-            print(yellow("● ") + bold(verb) + " " + dim((arg.splitlines() or [""])[0][:100]))
-            result = execute_tool(fn_name, args, auto_approve=auto_approve)
+            parse_error = False
+            args = None
+            if isinstance(raw_args, dict):
+                args = raw_args
+            elif isinstance(raw_args, str):
+                try:
+                    parsed = json.loads(raw_args)
+                    if isinstance(parsed, dict):
+                        args = parsed
+                    else:
+                        parse_error = True
+                except Exception:
+                    parse_error = True
+            else:
+                parse_error = True
+
+            if is_cut_off or parse_error or args is None:
+                verb = fn_name or "Tool"
+                print(yellow("● ") + bold(verb) + " " + red("[cut off - not executed]"))
+                result = "Error: that was cut off, write the file in smaller parts"
+            else:
+                verb, key = TOOL_VERBS.get(fn_name, (fn_name, None))
+                arg = str(args.get(key, "")) if key else ", ".join(f"{k}={v!r}" for k, v in args.items())
+                print(yellow("● ") + bold(verb) + " " + dim((arg.splitlines() or [""])[0][:100]))
+                result = execute_tool(fn_name, args, auto_approve=auto_approve)
+
             messages.append({
                 "role": "tool",
                 "tool_call_id": call_id,
                 "content": str(result)
             })
+
+    if turns >= max_turns and tool_calls:
+        print(yellow(f"Reached the {max_turns}-step limit."))
+        if not final_text and not failed:
+            final_text = f"Reached the {max_turns}-step limit."
 
     if final_text:
         STATE["history"].append({"role": "user", "content": prompt})

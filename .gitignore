@@ -44,6 +44,7 @@ htmlcov/
 .hypothesis/
 .tox/
 .nox/
+model_validation/
 
 # QA test run reports, skills & agent testing kit
 qa_reports/

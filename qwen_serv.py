@@ -4,12 +4,11 @@ Qwen coder on Kaggle (free 2x T4 GPUs) -> OpenAI-style endpoint -> public tunnel
 
 HOW TO USE
   1. Kaggle notebook > right sidebar > Session options:
-       - Accelerator: GPU T4 x2   (needed for the 30B coder model; one GPU runs the small model)
+       - Accelerator: GPU T4 x2   (needed for 30B/32B coder models; one GPU runs smaller models)
        - Internet: On             (needs a phone-verified Kaggle account)
   2. Paste this ENTIRE file into ONE code cell and run it.
-  3. Setup installs a prebuilt llama.cpp (~1-2 min; compiles only if that fails) while the ~20 GB
-     model downloads, so the download is what you wait on. When ready it prints the URL and
-     key. Use them on your own computer (for example with `/connect <url> <key>` in `borrow`).
+  3. Setup takes ~3–5 min (installs prebuilt llama.cpp in ~1–2 min while downloading the model).
+     When ready it prints the URL and key. Use them on your own computer (for example with `/connect <url> <key>` in `borrow`).
   4. The cell keeps running on purpose (it holds the server open). Stop the cell to shut down.
 
 Every step stops with a clear error and a log tail if it fails.

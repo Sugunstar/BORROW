@@ -1,7 +1,7 @@
 # BORROW - Brain On Remote, Run On Workstation
 
 Autonomous terminal coding agent (**Claude Code & agy style**) powered by a self-hosted open coder model (**Qwen2.5-Coder / Qwen3-Coder**).
-The model runs for free on Kaggle's dual Tesla T4 GPUs and connects directly to your local workstation through an encrypted Cloudflare quick tunnel.
+The model runs for free on Kaggle's dual Tesla T4 GPUs and connects to your local workstation through a Cloudflare quick tunnel.
 
 No local GPU, no API subscription fees, and no closed-source vendor lock-in.
 
@@ -39,7 +39,7 @@ No local GPU, no API subscription fees, and no closed-source vendor lock-in.
 | `qwen_serv.py` | Kaggle notebook | Prebuilt CUDA `llama-server`, fast Hugging Face model downloads, starts OpenAI-compatible API server, and opens Cloudflare tunnel |
 | `borrow.py` + `pyproject.toml` | Your workstation | The `borrow` CLI: Autonomous agent loop, tool execution (read/edit/write/search/run), interactive colored diffs, live streaming spinners, command menu, and chat memory |
 
-Observed performance on Kaggle 2x Tesla T4:
+Speeds observed on my run (Kaggle 2x Tesla T4):
 - **Qwen3-Coder-30B-A3B (MoE):** ~58–68 tokens/second (3.3B active parameters per token).
 - **Qwen2.5-Coder-32B-Instruct (Dense):** ~14–18 tokens/second (highest accuracy on multi-file coding and subtle bugs).
 
@@ -272,7 +272,7 @@ Features tested:
 
 ## Settings and saved data
 
-- Configuration is persisted at `~/.borrow.json` (URL and encrypted bearer key, `0600` permissions).
+- Configuration is persisted at `~/.borrow.json` (URL and bearer key saved as plain text with restricted `0600` permissions).
 - Prompt history is stored in `~/.borrow_history`.
 - Set environment variables `ASK_URL` and `ASK_KEY` to override saved configuration (ideal for CI/CD).
 
@@ -290,11 +290,13 @@ MODEL_CHOICE = "auto"   # "auto" | "coder32b_dense" | "coder30b" | "coder14b_den
 THINKING     = True     # Enable reasoning tokens when supported
 ```
 
+*Note: Speeds below are observed on my run on Kaggle 2x Tesla T4.*
+
 | Preset | Model | Context | Required VRAM | Characteristics |
 |---|---|---|---|---|
-| `coder32b_dense` | Qwen2.5-Coder-32B-Instruct (Q4_K_M) | 32768 | ~26 GB | **Highest coding accuracy**: Best for complex multi-file agentic edits (~14–18 tok/s). |
-| `coder30b` | Qwen3-Coder-30B-A3B-Instruct (Q4_K_M) | 32768 | ~26 GB | **Blazing fast MoE**: 3.3B active parameters (~58–68 tok/s). Excellent responsiveness. |
-| `coder14b_dense` | Qwen2.5-Coder-14B-Instruct (Q4_K_M) | 32768 | ~12 GB | Balanced reasoning, fits on a single T4 GPU (~25–35 tok/s). |
+| `coder32b_dense` | Qwen2.5-Coder-32B-Instruct (Q4_K_M) | 32768 | ~26 GB | **Highest coding accuracy**: Best for complex multi-file agentic edits (~14–18 tok/s observed on my run). |
+| `coder30b` | Qwen3-Coder-30B-A3B-Instruct (Q4_K_M) | 32768 | ~26 GB | **Blazing fast MoE**: 3.3B active parameters (~58–68 tok/s observed on my run). Excellent responsiveness. |
+| `coder14b_dense` | Qwen2.5-Coder-14B-Instruct (Q4_K_M) | 32768 | ~12 GB | Balanced reasoning, fits on a single T4 GPU (~25–35 tok/s observed on my run). |
 
 ## Limits and honest expectations
 
@@ -306,7 +308,7 @@ THINKING     = True     # Enable reasoning tokens when supported
 
 - **Bearer Key Protection**: The random bearer key generated on Kaggle prevents unauthorized access to your tunnel. Never share your `/connect` string publicly.
 - **Workstation Isolation**: Files are edited only within your active workspace. Diffs require user confirmation unless explicit auto-approval (`-y` or `/auto`) is granted.
-- **No Third-Party AI Data Collection**: Prompts flow directly from your workstation through an encrypted Cloudflare quick tunnel to your own private Kaggle instance.
+- **Traffic & Infrastructure**: Traffic goes through Cloudflare (quick tunnel) and Kaggle (running your private llama-server instance). The random bearer key prevents unauthorized access to your endpoint.
 
 ## Troubleshooting
 
