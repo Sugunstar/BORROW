@@ -19,7 +19,7 @@ import requests
 # ----------------------------- settings you may edit -----------------------------
 MODEL_CHOICE   = "auto"           # "auto" (picks best coder model), "coder30b", "coder32b_dense", etc.
 KV_CACHE_QUANT = "q4_0"           # "q4_0", "q8_0", or "f16". q4_0 cuts KV cache by 4x, fitting large context purely in VRAM
-THINKING       = False            # False = immediate execution for coding agents (creates files/edits directly). True = long internal monologue
+THINKING       = True             # Enable reasoning tokens when supported to allow model planning
 PORT           = 8080
 UA             = {"User-Agent": "curl/8.5.0"}   # Cloudflare can reject python's default user agent
 

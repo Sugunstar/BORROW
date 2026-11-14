@@ -253,3 +253,48 @@ def test_prune_tool_outputs_when_context_nears_limit(monkeypatch):
     assert "First long output line 1" in messages[3]["content"]
     assert len(messages[3]["content"]) < 300
 
+
+# -----------------------------------------------------------------------------
+# Tests for resilient editing and AST symbol extraction
+# -----------------------------------------------------------------------------
+def test_tool_edit_file_strips_read_file_line_prefixes(tmp_path):
+    f = tmp_path / "calc.py"
+    f.write_text("def subtract(a, b):\n    return a + b\n", encoding="utf-8")
+    # Model copies line-numbered output from read_file into target
+    target_with_prefixes = "   1 | def subtract(a, b):\n   2 |     return a + b"
+    replacement = "def subtract(a, b):\n    return a - b"
+    res = borrow.tool_edit_file(str(f), target=target_with_prefixes, replacement=replacement, auto_approve=True)
+    assert "Successfully updated" in res
+    assert "return a - b" in f.read_text(encoding="utf-8")
+
+
+def test_tool_edit_file_trailing_whitespace_tolerance(tmp_path):
+    f = tmp_path / "whitespace.py"
+    f.write_text("x = 1   \ny = 2\n", encoding="utf-8")
+    # Target lacks the trailing spaces that exist in the file
+    res = borrow.tool_edit_file(str(f), target="x = 1\ny = 2", replacement="x = 10\ny = 20", auto_approve=True)
+    assert "Successfully updated" in res
+    assert "x = 10" in f.read_text(encoding="utf-8")
+
+
+def test_tool_edit_file_catches_syntax_error(tmp_path):
+    f = tmp_path / "bad_syntax.py"
+    f.write_text("def foo():\n    return 1\n", encoding="utf-8")
+    # Proposed replacement has broken syntax (unclosed parenthesis)
+    bad_replacement = "def foo(:\n    return 1"
+    res = borrow.tool_edit_file(str(f), target="def foo():\n    return 1", replacement=bad_replacement, auto_approve=True)
+    assert "introduce a SyntaxError" in res
+    # Ensure original file was NOT modified
+    assert f.read_text(encoding="utf-8") == "def foo():\n    return 1\n"
+
+
+def test_extract_file_symbols(tmp_path):
+    f = tmp_path / "module.py"
+    f.write_text(
+        "class App:\n    pass\n\ndef helper():\n    pass\n\ndef run():\n    pass\n",
+        encoding="utf-8"
+    )
+    syms = borrow.extract_file_symbols(f)
+    assert "classes: App" in syms
+    assert "funcs: helper, run" in syms
+

@@ -8,7 +8,7 @@ Connect:       set ASK_URL / ASK_KEY (printed by the Kaggle script) or type  /co
 Inside the CLI type  /  to open the command menu, @ to attach files, plain text to chat.
 No flags to remember: type /help for every command, its flags and what it does.
 """
-import difflib, json, math, os, random, re, secrets, shlex, shutil, subprocess, sys, textwrap, threading, time
+import ast, difflib, json, math, os, random, re, secrets, shlex, shutil, subprocess, sys, textwrap, threading, time
 import urllib.error, urllib.request
 from pathlib import Path
 
@@ -951,6 +951,31 @@ def tool_edit_file(path, target, replacement, auto_approve=False):
 
     count = c_norm.count(t_norm)
     if count == 0:
+        # Resilient match 1: Strip line-number prefixes (e.g. "   1 | " or "1: ") if copied from read_file
+        cleaned_lines = [re.sub(r"^\s*\d+\s*[|:]\s?", "", line) for line in t_norm.splitlines()]
+        cleaned_t = "\n".join(cleaned_lines)
+        if cleaned_t != t_norm and c_norm.count(cleaned_t) == 1:
+            t_norm = cleaned_t
+            count = 1
+
+    if count == 0:
+        # Resilient match 2: Trailing whitespace tolerance on line-by-line basis
+        t_lines = t_norm.splitlines()
+        c_lines = c_norm.splitlines()
+        if t_lines and len(t_lines) <= len(c_lines):
+            t_stripped = [l.rstrip() for l in t_lines]
+            matches = []
+            for i in range(len(c_lines) - len(t_lines) + 1):
+                if [c_lines[i + j].rstrip() for j in range(len(t_lines))] == t_stripped:
+                    matches.append(i)
+            if len(matches) == 1:
+                idx = matches[0]
+                t_norm = "\n".join(c_lines[idx:idx + len(t_lines)])
+                count = 1
+            elif len(matches) > 1:
+                return f"Error: target string occurs {len(matches)} times in {path}. Provide more surrounding context lines so the target is unique."
+
+    if count == 0:
         return f"Error: target string not found in {path}. Make sure whitespace and indentation match exactly."
     if count > 1:
         return f"Error: target string occurs {count} times in {path}. Provide more surrounding context lines so the target is unique."
@@ -958,6 +983,13 @@ def tool_edit_file(path, target, replacement, auto_approve=False):
     new_content = c_norm.replace(t_norm, r_norm, 1)
     if "\r\n" in content:
         new_content = new_content.replace("\n", "\r\n")
+
+    # Syntax verification for Python files
+    if p.suffix == ".py":
+        try:
+            ast.parse(new_content)
+        except SyntaxError as syn_err:
+            return f"Error: proposed edit would introduce a SyntaxError in {path} at line {syn_err.lineno}: {syn_err.msg}. File was not modified. Please correct the replacement."
 
     diff_text = format_diff(content, new_content, path)
     print("\n" + bold(f"Proposed edit for {path}:"))
@@ -1124,6 +1156,31 @@ def execute_tool(name, args, auto_approve=False):
     return f"Unknown tool: {name}"
 
 
+def extract_file_symbols(file_path):
+    """Extract top-level classes and functions to give the agent an AST semantic map."""
+    try:
+        content = file_path.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(content)
+        classes = [node.name for node in tree.body if isinstance(node, ast.ClassDef)]
+        funcs = [node.name for node in tree.body if isinstance(node, ast.FunctionDef)]
+        parts = []
+        if classes:
+            c_str = ", ".join(classes[:3])
+            if len(classes) > 3:
+                c_str += f" +{len(classes)-3}"
+            parts.append(f"classes: {c_str}")
+        if funcs:
+            f_str = ", ".join(funcs[:5])
+            if len(funcs) > 5:
+                f_str += f" +{len(funcs)-5}"
+            parts.append(f"funcs: {f_str}")
+        if parts:
+            return f" ({'; '.join(parts)})"
+    except Exception:
+        pass
+    return ""
+
+
 def get_workspace_summary(max_files=60):
     ignored = {".git", "__pycache__", ".venv", ".pytest_cache", "node_modules", "build", "dist", ".qa-venv"}
     files_list = []
@@ -1136,7 +1193,8 @@ def get_workspace_summary(max_files=60):
         if p.is_file():
             try:
                 rel = p.relative_to(root)
-                files_list.append(str(rel))
+                extra = extract_file_symbols(p) if p.suffix == ".py" else ""
+                files_list.append(f"{rel}{extra}")
                 if len(files_list) >= max_files:
                     break
             except ValueError:
@@ -1168,7 +1226,18 @@ def extract_text_tool_calls(text):
             if raw.startswith("```"):
                 raw = re.sub(r"^```(?:json)?\s*", "", raw)
                 raw = re.sub(r"\s*```$", "", raw)
-            data = json.loads(raw)
+            try:
+                data = json.loads(raw)
+            except Exception:
+                # If JSON was truncated or cut off, attempt to salvage tool name so cut-off logic can handle it
+                fn_match = re.search(r'["\']name["\']\s*:\s*["\']([^"\']+)["\']', raw)
+                if fn_match:
+                    calls.append({
+                        "id": f"call_{secrets.token_hex(4)}",
+                        "type": "function",
+                        "function": {"name": fn_match.group(1), "arguments": raw}
+                    })
+                continue
             if isinstance(data, dict) and "name" in data:
                 fn_name = data["name"]
                 args = data.get("arguments", {})
@@ -1247,7 +1316,9 @@ def run_agent(prompt, auto_approve=False, max_turns=12):
         "   - Only use `write_file` for brand new files or full rewrites.\n"
         "   - Verify your work with `run_command` when appropriate.\n"
         "   - Be concise and explain what you did when done.\n"
-        "5. ACT IMMEDIATELY: Do not spend turns pondering or outputting long internal monologues about what you plan to do. Execute the appropriate tool call immediately in this step.\n\n"
+        "5. STRUCTURED REASONING & DISCIPLINED ACTION:\n"
+        "   - Briefly outline your plan or reasoning before executing actions, especially when asked to plan or explore.\n"
+        "   - Execute purposeful tool calls to inspect, modify, and verify code without stalling or repeating completed actions.\n\n"
         f"Workspace Directory: {Path.cwd()}\n"
         f"Workspace Files:\n{ws_tree}\n"
     )
@@ -1274,6 +1345,12 @@ def run_agent(prompt, auto_approve=False, max_turns=12):
 
         if not tool_calls:
             tool_calls = extract_text_tool_calls(text or "") or extract_text_tool_calls(STATE.get("thought", ""))
+            if not tool_calls and "<tool_call>" in (text or ""):
+                tool_calls = [{
+                    "id": f"call_cut_{secrets.token_hex(4)}",
+                    "type": "function",
+                    "function": {"name": "tool", "arguments": text or ""}
+                }]
             if tool_calls and "<tool_call>" in (text or ""):
                 text = re.sub(r"<tool_call>.*?(?:</tool_call>|$)", "", text, flags=re.DOTALL).strip()
 
@@ -1282,6 +1359,22 @@ def run_agent(prompt, auto_approve=False, max_turns=12):
 
         if not tool_calls:
             # Model finished without calling any tools
+            if finish == "length":
+                rounds = 0
+                while finish == "length" and rounds < MAX_CONTINUES:
+                    rounds += 1
+                    cont_lbl = f"{step_lbl} (continuing {rounds}/{MAX_CONTINUES})"
+                    print(dim(f"[reached the {DEFAULT_MAX_TOKENS}-token limit; asking the model to continue ({rounds}/{MAX_CONTINUES})]"))
+                    more_res = stream_chat(
+                        messages + [{"role": "assistant", "content": final_text or text or ""},
+                                    {"role": "user", "content": CONTINUE_PROMPT}],
+                        temp=0.2, max_tokens=DEFAULT_MAX_TOKENS, tools=None, status_label=cont_lbl
+                    )
+                    more_text = more_res[0] if more_res else None
+                    finish = more_res[1] if more_res and len(more_res) > 1 else "stop"
+                    if more_text is None:
+                        break
+                    final_text = merge_continuation(final_text, more_text)
             break
 
         # Record assistant tool call turn
