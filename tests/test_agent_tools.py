@@ -229,6 +229,29 @@ def test_twelve_step_limit_printed(monkeypatch, capsys):
     assert "Reached the 12-step limit." in captured
 
 
+def test_agent_runs_beyond_twelve_steps_by_default(monkeypatch):
+    step_count = [0]
+
+    def mock_stream_chat(messages, *args, **kwargs):
+        step_count[0] += 1
+        if step_count[0] < 15:
+            return (f"step {step_count[0]}", "stop", [{
+                "id": f"call_{step_count[0]}",
+                "type": "function",
+                "function": {"name": "run_command", "arguments": '{"command": "echo step"}'}
+            }])
+        else:
+            return ("Finished all steps", "stop", [])
+
+    monkeypatch.setattr(borrow, "stream_chat", mock_stream_chat)
+    monkeypatch.setattr(borrow, "is_pure_greeting", lambda text: False)
+    monkeypatch.setattr(borrow, "execute_tool", lambda name, args, **kw: "step output")
+
+    result = borrow.run_agent("keep going", auto_approve=True)
+    assert step_count[0] == 15
+    assert "Finished all steps" in result
+
+
 # -----------------------------------------------------------------------------
 # Tests for context pruning
 # -----------------------------------------------------------------------------
@@ -291,10 +314,50 @@ def test_tool_edit_file_catches_syntax_error(tmp_path):
 def test_extract_file_symbols(tmp_path):
     f = tmp_path / "module.py"
     f.write_text(
-        "class App:\n    pass\n\ndef helper():\n    pass\n\ndef run():\n    pass\n",
+        "class App:\n    pass\n\ndef helper():\n    pass\n\nasync def run():\n    pass\n",
         encoding="utf-8"
     )
     syms = borrow.extract_file_symbols(f)
     assert "classes: App" in syms
     assert "funcs: helper, run" in syms
+
+
+def test_safe_path_forbids_git_internals(tmp_path):
+    with pytest.raises(PermissionError, match=r"\.git"):
+        borrow.safe_path(".git/config")
+    with pytest.raises(PermissionError, match=r"\.git"):
+        borrow.safe_path(".git/hooks/pre-commit")
+
+
+def test_tool_read_file_empty_file(tmp_path):
+    empty = tmp_path / "empty.txt"
+    empty.write_text("", encoding="utf-8")
+    res = borrow.tool_read_file(str(empty))
+    assert "empty file" in res
+
+
+def test_tool_write_file_catches_syntax_error(tmp_path):
+    target = tmp_path / "broken.py"
+    res = borrow.tool_write_file(str(target), "def foo(:\n    pass\n", auto_approve=True)
+    assert "contains a SyntaxError" in res
+    assert not target.exists()
+
+
+def test_dotfile_editing_and_writing(tmp_path):
+    dotfile = tmp_path / ".gitignore"
+    res = borrow.tool_write_file(str(dotfile), "*.pyc\n", auto_approve=True)
+    assert "Successfully wrote" in res
+    assert dotfile.read_text(encoding="utf-8") == "*.pyc\n"
+    res = borrow.tool_edit_file(str(dotfile), target="*.pyc", replacement="*.pyc\n__pycache__", auto_approve=True)
+    assert "Successfully updated" in res
+    assert "__pycache__" in dotfile.read_text(encoding="utf-8")
+
+
+def test_parse_args_chat_with_apostrophe_and_newlines(tmp_path):
+    line = "Why doesn't this function work?\n    def compute():\n        return 42"
+    args = borrow.parse_args_chat(line)
+    assert args["files"] == []
+    assert "Why doesn't this function work?" in args["text"]
+    assert "    def compute():\n        return 42" in args["text"]
+
 
