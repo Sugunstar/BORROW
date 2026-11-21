@@ -20,6 +20,7 @@ import requests
 MODEL_CHOICE   = "auto"           # "auto" (picks best coder model), "coder30b", "coder32b_dense", etc.
 KV_CACHE_QUANT = "q4_0"           # "q4_0", "q8_0", or "f16". q4_0 cuts KV cache by 4x, fitting large context purely in VRAM
 THINKING       = True             # Enable reasoning tokens when supported to allow model planning
+USE_HF_TRANSFER = True            # False if network blips or hf-transfer hangs mid-download
 PORT           = 8080
 UA             = {"User-Agent": "curl/8.5.0"}   # Cloudflare can reject python's default user agent
 
@@ -307,12 +308,18 @@ def download_model(repo, quant):
                         print(f"Using pre-mounted model from dataset: {found} ({size_gb:.1f} GB) [0s wait!]")
                         return found
 
-    # 2. Enable ultra-fast multi-threaded download via hf-transfer
-    try:
-        import hf_transfer
-    except ImportError:
-        sh("pip install -q hf-transfer")
-    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+    # 2. Configure Hugging Face cache and transfer settings
+    os.environ["HF_HUB_DISABLE_XET"] = "1"              # Prevents Xet protocol hanging/deadlocks on Kaggle
+    os.environ["HF_HOME"] = f"{WORK}/hf_cache"          # Keeps cache on same disk partition to prevent duplicate copies
+
+    if USE_HF_TRANSFER:
+        try:
+            import hf_transfer
+        except ImportError:
+            sh("pip install -q hf-transfer")
+        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+    else:
+        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
     try:
         from huggingface_hub import list_repo_files, hf_hub_download
@@ -324,8 +331,16 @@ def download_model(repo, quant):
     matches = sorted([f for f in files if quant.lower() in f.lower()], key=len)
     if not matches:
         raise RuntimeError(f"No '{quant}' file in {repo}. Files available:\n" + "\n".join(files))
-    print(f"Downloading {len(matches)} file(s) from {repo} (accelerated with hf-transfer)...")
-    paths = [hf_hub_download(repo, f, local_dir=f"{WORK}/models") for f in matches]
+    print(f"Downloading {len(matches)} file(s) from {repo}...")
+    try:
+        paths = [hf_hub_download(repo, f, local_dir=f"{WORK}/models") for f in matches]
+    except Exception as e:
+        if os.environ.get("HF_HUB_ENABLE_HF_TRANSFER") == "1":
+            print(f"  hf-transfer stalled or failed ({e}). Retrying with resilient standard downloader...")
+            os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+            paths = [hf_hub_download(repo, f, local_dir=f"{WORK}/models") for f in matches]
+        else:
+            raise
     first = next((p for p in paths if "00001-of" in p), paths[0])   # split models: point at shard 1
     total = sum(os.path.getsize(p) for p in paths) / 1e9
     print(f"Model ready: {first} ({total:.1f} GB total)")
@@ -477,7 +492,7 @@ def _preinstall_download_deps():
         import huggingface_hub
     except ImportError:
         sh("pip install -q huggingface_hub", quiet=True)
-    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1" if USE_HF_TRANSFER else "0"
 
 
 def _download_cloudflared():

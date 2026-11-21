@@ -8,11 +8,11 @@ Connect:       set ASK_URL / ASK_KEY (printed by the Kaggle script) or type  /co
 Inside the CLI type  /  to open the command menu, @ to attach files, plain text to chat.
 No flags to remember: type /help for every command, its flags and what it does.
 """
-import ast, difflib, json, math, os, random, re, secrets, shlex, shutil, subprocess, sys, textwrap, threading, time
+import ast, difflib, http.client, json, math, os, random, re, secrets, shlex, shutil, subprocess, sys, textwrap, threading, time
 import urllib.error, urllib.request
 from pathlib import Path
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 CONFIG_PATH = Path.home() / ".borrow.json"
 LEGACY_CONFIG_PATH = Path.home() / ".qwen_cli.json"   # older versions saved here
 HISTORY_PATH = Path.home() / ".borrow_history"
@@ -588,8 +588,10 @@ def stream_chat(messages, temp, max_tokens, top_p=0.8, top_k=20, repeat_penalty=
                             print(content, end="", flush=True)
             except KeyboardInterrupt:
                 spinner.stop(dim("\n[interrupted]"))
-                valid_tcs = [tc for tc in tool_calls_acc if tc["function"]["name"]]
-                return (text, finish, valid_tcs) if tools is not None else (text, finish)
+                return (text, "interrupted", []) if tools is not None else (text, "interrupted")
+            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, http.client.HTTPException) as stream_err:
+                spinner.stop(red(f"\n[stream interrupted: {stream_err}]"))
+                return (text, "interrupted", []) if tools is not None else (text, "interrupted")
             finally:
                 spinner.stop()
             close_thought()                     # the stream ended while the model was still thinking
@@ -608,15 +610,16 @@ def stream_chat(messages, temp, max_tokens, top_p=0.8, top_k=20, repeat_penalty=
     except urllib.error.HTTPError as e:
         spinner.stop()
         print(red(f"HTTP {e.code}: {e.read().decode(errors='replace')[:300]}"))
+        return (None, "error", []) if tools is not None else (None, "error")
     except Exception as e:
         spinner.stop()
         print(red(f"Request failed (is the Kaggle session still running? try /status): {e}"))
-    return (None, None, []) if tools is not None else (None, None)
+        return (None, "error", []) if tools is not None else (None, "error")
 
 
 def trim_history(extra_chars=0):
     h = STATE["history"]
-    while len(h) > 2 and (sum(len(m["content"]) for m in h) + extra_chars) > MAX_HISTORY_CHARS:
+    while len(h) > 2 and (sum(len(str(m.get("content") or "")) for m in h) + extra_chars) > MAX_HISTORY_CHARS:
         del h[:2]
 
 
@@ -628,8 +631,8 @@ def compact(focus="", reason=""):
         print(dim("Nothing to compact yet."))
         return False
     old, keep = (h[:-2], h[-2:]) if len(h) > 2 else (h, [])
-    before = STATE.get("ctx_used") or sum(len(m["content"]) for m in h) // 4
-    transcript = "\n\n".join(f"{m['role'].upper()}:\n{m['content']}" for m in old)[-MAX_HISTORY_CHARS:]
+    before = STATE.get("ctx_used") or sum(len(str(m.get("content") or "")) for m in h) // 4
+    transcript = "\n\n".join(f"{m.get('role', '').upper()}:\n{m.get('content') or ''}" for m in old)[-MAX_HISTORY_CHARS:]
     ask_for = "Summarize this conversation." + (f" Pay special attention to: {focus}" if focus else "")
     res = stream_chat([{"role": "system", "content": COMPACT_SYSTEM},
                        {"role": "user", "content": f"{transcript}\n\n---\n{ask_for}"}],
@@ -640,7 +643,7 @@ def compact(focus="", reason=""):
         return False
     STATE["history"] = [{"role": "user", "content": "Summary of our conversation so far:\n" + summary},
                         {"role": "assistant", "content": "Understood. I'll continue from this summary."}] + keep
-    STATE["ctx_used"] = sum(len(m["content"]) for m in STATE["history"]) // 4    # rough until the next reply
+    STATE["ctx_used"] = sum(len(str(m.get("content") or "")) for m in STATE["history"]) // 4    # rough until the next reply
     save_session()
     print(gold("◇ ") + dim(f"Compacted {len(old)} messages into a summary{reason} · "
                            f"~{fmt_k(before)} → ~{fmt_k(STATE['ctx_used'])} tokens"))
@@ -653,7 +656,7 @@ def maybe_compact(extra_chars=0):
         trim_history(extra_chars)
         return
     n, used = STATE.get("n_ctx") or 0, STATE.get("ctx_used") or 0
-    chars = sum(len(m["content"]) for m in STATE["history"]) + extra_chars
+    chars = sum(len(str(m.get("content") or "")) for m in STATE["history"]) + extra_chars
     # > 4 messages: right after compacting there are 4 (summary pair + last exchange); don't re-summarize those
     if len(STATE["history"]) > 4 and ((n and used >= n * COMPACT_AT) or chars > MAX_HISTORY_CHARS):
         pct = f" ({used * 100 // n}% of context used)" if n and used else ""
@@ -872,6 +875,15 @@ TOOL_VERBS = {"read_file": ("Read", "path"), "edit_file": ("Edit", "path"), "wri
               "list_directory": ("List", "path"), "search_files": ("Search", "query"), "run_command": ("Run", "command")}
 
 
+def is_subpath(p: Path, base: Path) -> bool:
+    """Check if p is base or a descendant of base (compatible with Python 3.8+)."""
+    try:
+        p.relative_to(base)
+        return True
+    except ValueError:
+        return False
+
+
 def safe_path(path="."):
     """Validate that path is inside the current workspace folder and not a forbidden file.
     Refuses anything outside the current folder, and always refuses .env, ~/.ssh, and ~/.borrow.json.
@@ -882,19 +894,21 @@ def safe_path(path="."):
     p = Path(path).expanduser().resolve()
 
     # Block any path outside the project folder
-    if p != cwd and not p.is_relative_to(cwd):
+    if p != cwd and not is_subpath(p, cwd):
         raise PermissionError(f"Access denied: '{path}' is outside the project folder ({cwd}).")
 
     # Always refuse ~/.ssh, ~/.borrow.json, and .env
     ssh_dir = Path("~/.ssh").expanduser().resolve()
     borrow_cfg = Path("~/.borrow.json").expanduser().resolve()
 
-    if p == ssh_dir or p.is_relative_to(ssh_dir) or ".ssh" in p.parts:
+    if p == ssh_dir or is_subpath(p, ssh_dir) or ".ssh" in p.parts:
         raise PermissionError("Access denied: access to ~/.ssh is forbidden.")
     if p == borrow_cfg or p.name == ".borrow.json":
         raise PermissionError("Access denied: access to ~/.borrow.json is forbidden.")
     if p.name == ".env" or p.name.startswith(".env.") or p.name.endswith(".env") or ".env" in p.parts:
         raise PermissionError("Access denied: access to .env files is forbidden.")
+    if ".git" in p.parts:
+        raise PermissionError("Access denied: access to .git is forbidden.")
 
     return p
 
@@ -918,10 +932,25 @@ def tool_read_file(path, start_line=1, end_line=None):
         return f"Error reading {path}: {e}"
 
     total_lines = len(lines)
-    start = max(1, start_line or 1)
-    end = min(total_lines, end_line or total_lines)
+    if total_lines == 0:
+        return f"File: {path}\n(empty file)"
+
+    try:
+        start = int(start_line) if start_line is not None else 1
+        start = max(1, start)
+    except (ValueError, TypeError):
+        return f"Error: 'start_line' must be an integer, got {start_line!r}."
+
+    try:
+        end = int(end_line) if end_line is not None else total_lines
+        end = min(total_lines, end)
+    except (ValueError, TypeError):
+        return f"Error: 'end_line' must be an integer, got {end_line!r}."
+
     if start > total_lines:
         return f"File {path} only has {total_lines} lines (requested start line {start})."
+    if start > end:
+        return f"Error: 'start_line' ({start}) cannot be greater than 'end_line' ({end})."
 
     if end - start + 1 > 400:
         end = start + 399
@@ -981,7 +1010,8 @@ def tool_edit_file(path, target, replacement, auto_approve=False):
         return f"Error: target string occurs {count} times in {path}. Provide more surrounding context lines so the target is unique."
 
     new_content = c_norm.replace(t_norm, r_norm, 1)
-    if "\r\n" in content:
+    has_crlf = "\r\n" in content and content.count("\r\n") >= content.count("\n") / 2
+    if has_crlf:
         new_content = new_content.replace("\n", "\r\n")
 
     # Syntax verification for Python files
@@ -1001,14 +1031,20 @@ def tool_edit_file(path, target, replacement, auto_approve=False):
         if not prompt_confirm(f"Apply changes to {path}?"):
             return f"User declined the changes to {path}."
 
+    tmp_path = p.with_name(f".{p.name}.{secrets.token_hex(4)}.borrow_tmp")
     try:
-        tmp_path = p.with_suffix(p.suffix + ".borrow_tmp")
         tmp_path.write_text(new_content, encoding="utf-8")
         tmp_path.replace(p)
         print(green(f"✔ Successfully edited {path}"))
         return f"Successfully updated {path}."
     except OSError as e:
         return f"Error writing to {path}: {e}"
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
 
 
 def tool_write_file(path, content, auto_approve=False):
@@ -1037,15 +1073,28 @@ def tool_write_file(path, content, auto_approve=False):
         if not prompt_confirm(f"{action_label} ({lines_count} lines)?"):
             return f"User declined to write {path}."
 
+    # Syntax verification for Python files
+    if p.suffix == ".py":
+        try:
+            ast.parse(content)
+        except SyntaxError as syn_err:
+            return f"Error: proposed content contains a SyntaxError in {path} at line {syn_err.lineno}: {syn_err.msg}. File was not written."
+
+    tmp_path = p.with_name(f".{p.name}.{secrets.token_hex(4)}.borrow_tmp")
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = p.with_suffix(p.suffix + ".borrow_tmp")
         tmp_path.write_text(content, encoding="utf-8")
         tmp_path.replace(p)
         print(green(f"✔ {action_label} ({lines_count} lines)"))
         return f"Successfully wrote {path} ({lines_count} lines)."
     except OSError as e:
         return f"Error writing {path}: {e}"
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
 
 
 def tool_list_directory(path="."):
@@ -1063,7 +1112,7 @@ def tool_list_directory(path="."):
 
     results = []
     for e in entries:
-        if e.name in ignored or e.name == ".borrow.json" or e.name == ".env" or e.name.startswith(".env.") or e.name == ".ssh":
+        if e.name in ignored or e.name.endswith(".egg-info") or e.name == ".borrow.json" or e.name == ".env" or e.name.startswith(".env.") or e.name == ".ssh":
             continue
         if e.is_dir():
             results.append(f"  [dir]  {e.name}/")
@@ -1095,7 +1144,7 @@ def tool_search_files(query, path="."):
         matches = []
         cwd = Path.cwd().resolve()
         for root, dirs, files in os.walk(p):
-            dirs[:] = [d for d in dirs if d not in ignored and d != ".env" and d != ".ssh"]
+            dirs[:] = [d for d in dirs if d not in ignored and not d.endswith(".egg-info") and d != ".env" and d != ".ssh"]
             for f in sorted(files):
                 if f == ".borrow.json" or f == ".env" or f.startswith(".env.") or f == ".ssh":
                     continue
@@ -1130,6 +1179,7 @@ def tool_run_command(command, auto_approve=False):
     try:
         r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=120)
         out = (r.stdout + r.stderr).strip()
+        out = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", out)
         truncated = out[-4000:] if len(out) > 4000 else out
         return f"Command: {command}\nExit code: {r.returncode}\nOutput:\n{truncated}"
     except subprocess.TimeoutExpired:
@@ -1140,20 +1190,182 @@ def tool_run_command(command, auto_approve=False):
         spinner.stop()
 
 
+ALLOWED_TOOL_NAMES = {"read_file", "edit_file", "write_file", "list_directory", "search_files", "run_command"}
+
+
 def execute_tool(name, args, auto_approve=False):
-    if name == "read_file":
-        return tool_read_file(args.get("path", ""), args.get("start_line", 1), args.get("end_line"))
-    elif name == "edit_file":
-        return tool_edit_file(args.get("path", ""), args.get("target", ""), args.get("replacement", ""), auto_approve)
-    elif name == "write_file":
-        return tool_write_file(args.get("path", ""), args.get("content", ""), auto_approve)
-    elif name == "list_directory":
-        return tool_list_directory(args.get("path", "."))
-    elif name == "search_files":
-        return tool_search_files(args.get("query", ""), args.get("path", "."))
-    elif name == "run_command":
-        return tool_run_command(args.get("command", ""), auto_approve)
-    return f"Unknown tool: {name}"
+    """Safely execute a tool with input validation and exception boundary."""
+    if not isinstance(name, str) or not name.strip():
+        return f"Error: Invalid or missing tool name: {name!r}"
+    name = name.strip()
+    if name not in ALLOWED_TOOL_NAMES:
+        return f"Error: Unknown tool '{name}'. Available tools: {', '.join(sorted(ALLOWED_TOOL_NAMES))}"
+    if not isinstance(args, dict):
+        return f"Error: Arguments for tool '{name}' must be a dictionary/object, got {type(args).__name__}"
+
+    try:
+        if name == "read_file":
+            if "path" not in args:
+                return "Error: 'read_file' missing required argument 'path'."
+            path = args["path"]
+            if not isinstance(path, str) or not path.strip():
+                return "Error: 'read_file' requires a non-empty string argument 'path'."
+            start_line = args.get("start_line", 1)
+            end_line = args.get("end_line")
+            if start_line is not None:
+                try:
+                    start_line = int(start_line)
+                    if start_line < 1:
+                        start_line = 1
+                except (ValueError, TypeError):
+                    return f"Error: 'start_line' must be an integer, got {start_line!r}."
+            if end_line is not None:
+                try:
+                    end_line = int(end_line)
+                    if end_line < 1:
+                        return f"Error: 'end_line' must be an integer, got {end_line!r}."
+                except (ValueError, TypeError):
+                    return f"Error: 'end_line' must be an integer, got {end_line!r}."
+            if start_line is not None and end_line is not None and int(start_line) > int(end_line):
+                return f"Error: 'start_line' ({start_line}) cannot be greater than 'end_line' ({end_line})."
+            return tool_read_file(path, start_line, end_line)
+
+        elif name == "edit_file":
+            for req in ("path", "target", "replacement"):
+                if req not in args:
+                    return f"Error: 'edit_file' missing required argument '{req}'."
+                if not isinstance(args[req], str):
+                    return f"Error: 'edit_file' argument '{req}' must be a string, got {type(args[req]).__name__}."
+            if not args["path"].strip():
+                return "Error: 'edit_file' requires a non-empty string argument 'path'."
+            if not args["target"]:
+                return "Error: 'edit_file' requires a non-empty 'target' string to match."
+            return tool_edit_file(args["path"], args["target"], args["replacement"], auto_approve=auto_approve)
+
+        elif name == "write_file":
+            if "path" not in args or "content" not in args:
+                return "Error: 'write_file' missing required arguments ('path' and 'content')."
+            if not isinstance(args["path"], str):
+                return f"Error: 'write_file' argument 'path' must be a string, got {type(args['path']).__name__}."
+            if not isinstance(args["content"], str):
+                return f"Error: 'write_file' argument 'content' must be a string, got {type(args['content']).__name__}."
+            if not args["path"].strip():
+                return "Error: 'write_file' requires a non-empty string argument 'path'."
+            return tool_write_file(args["path"], args["content"], auto_approve=auto_approve)
+
+        elif name == "list_directory":
+            path = args.get("path", ".")
+            if path is None:
+                path = "."
+            if not isinstance(path, str):
+                return f"Error: 'list_directory' argument 'path' must be a string, got {type(path).__name__}."
+            return tool_list_directory(path)
+
+        elif name == "search_files":
+            if "query" not in args:
+                return "Error: 'search_files' missing required argument 'query'."
+            query = args["query"]
+            if not isinstance(query, str) or not query:
+                return "Error: 'search_files' requires a non-empty string argument 'query'."
+            path = args.get("path", ".")
+            if path is None:
+                path = "."
+            if not isinstance(path, str):
+                return f"Error: 'search_files' argument 'path' must be a string, got {type(path).__name__}."
+            return tool_search_files(query, path)
+
+        elif name == "run_command":
+            if "command" not in args:
+                return "Error: 'run_command' missing required argument 'command'."
+            command = args["command"]
+            if not isinstance(command, str):
+                return f"Error: 'run_command' argument 'command' must be a string, got {type(command).__name__}."
+            if not command.strip():
+                return "Error: 'run_command' requires a non-empty string argument 'command'."
+            return tool_run_command(command, auto_approve=auto_approve)
+
+    except Exception as e:
+        return f"Error: unexpected exception executing tool '{name}': {type(e).__name__}: {e}"
+
+    return f"Error: Unknown tool '{name}'"
+
+
+def normalize_tool_calls(tool_calls):
+    """Normalize every tool call: ensure valid structure, unique non-empty ID, and matching format."""
+    if not tool_calls:
+        return []
+    normalized = []
+    seen_ids = set()
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        tc_norm = dict(tc)
+        raw_id = tc_norm.get("id")
+        if isinstance(raw_id, str):
+            raw_id = raw_id.strip()
+        else:
+            raw_id = ""
+
+        if not raw_id or raw_id in seen_ids:
+            base_id = raw_id or f"call_{secrets.token_hex(4)}"
+            candidate = base_id
+            counter = 1
+            while candidate in seen_ids:
+                candidate = f"{base_id}_{counter}"
+                counter += 1
+            call_id = candidate
+        else:
+            call_id = raw_id
+
+        seen_ids.add(call_id)
+        tc_norm["id"] = call_id
+        tc_norm["type"] = "function"
+
+        fn = tc_norm.get("function")
+        if not isinstance(fn, dict):
+            fn = {"name": "", "arguments": "{}"}
+        else:
+            fn = dict(fn)
+            fn.setdefault("name", "")
+            raw_args = fn.get("arguments", "{}")
+            if isinstance(raw_args, dict):
+                try:
+                    fn["arguments"] = json.dumps(raw_args)
+                except Exception:
+                    fn["arguments"] = "{}"
+            elif not isinstance(raw_args, str):
+                fn["arguments"] = str(raw_args)
+        tc_norm["function"] = fn
+        normalized.append(tc_norm)
+    return normalized
+
+
+def _is_tool_error(content: str) -> bool:
+    c = str(content or "").strip()
+    return c.startswith("Error") or c.startswith("Access denied") or "[cut off" in c
+
+
+def _tool_call_signature(tc):
+    fn = tc.get("function", {})
+    name = fn.get("name", "")
+    raw_args = fn.get("arguments", "")
+    if isinstance(raw_args, dict):
+        try:
+            raw_args = json.dumps(raw_args, sort_keys=True)
+        except Exception:
+            raw_args = str(raw_args)
+    elif isinstance(raw_args, str):
+        try:
+            parsed = json.loads(raw_args)
+            if isinstance(parsed, dict):
+                raw_args = json.dumps(parsed, sort_keys=True)
+        except Exception:
+            pass
+    return (name, raw_args)
+
+
+def _turn_signatures(tcs):
+    return [_tool_call_signature(tc) for tc in tcs] if tcs else []
 
 
 def extract_file_symbols(file_path):
@@ -1162,7 +1374,7 @@ def extract_file_symbols(file_path):
         content = file_path.read_text(encoding="utf-8", errors="replace")
         tree = ast.parse(content)
         classes = [node.name for node in tree.body if isinstance(node, ast.ClassDef)]
-        funcs = [node.name for node in tree.body if isinstance(node, ast.FunctionDef)]
+        funcs = [node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
         parts = []
         if classes:
             c_str = ", ".join(classes[:3])
@@ -1186,7 +1398,7 @@ def get_workspace_summary(max_files=60):
     files_list = []
     root = Path.cwd().resolve()
     for p in root.rglob("*"):
-        if any(part in ignored for part in p.parts):
+        if any(part in ignored or part.endswith(".egg-info") for part in p.parts):
             continue
         if p.name == ".borrow.json" or p.name == ".env" or p.name.startswith(".env.") or ".ssh" in p.parts:
             continue
@@ -1215,41 +1427,59 @@ def is_pure_greeting(text):
 
 
 def extract_text_tool_calls(text):
-    """Fallback parser for models that output tool calls in plain text or <tool_call> tags."""
+    """Fallback parser for models that output tool calls in explicit <tool_call> tags in their response content.
+    Never parses reasoning/thought content, and ignores examples inside markdown code blocks."""
     if not text:
         return []
+
+    # Identify code block ranges to avoid executing tool-call examples in explanations
+    code_block_spans = []
+    for m in re.finditer(r"```.*?```", text, re.DOTALL):
+        code_block_spans.append((m.start(), m.end()))
+    for m in re.finditer(r"`[^`\n]+`", text):
+        code_block_spans.append((m.start(), m.end()))
+
+    def is_inside_code_block(start_pos, end_pos):
+        return any(cb_start <= start_pos and end_pos <= cb_end for cb_start, cb_end in code_block_spans)
+
     calls = []
-    # Match <tool_call>...</tool_call>
-    for m in re.finditer(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", text, re.DOTALL):
+    # Only match fully closed <tool_call>...</tool_call> tags
+    for m in re.finditer(r"<tool_call>\s*(.*?)\s*</tool_call>", text, re.DOTALL):
+        if is_inside_code_block(m.start(), m.end()):
+            continue
+        raw = m.group(1).strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
         try:
-            raw = m.group(1).strip()
-            if raw.startswith("```"):
-                raw = re.sub(r"^```(?:json)?\s*", "", raw)
-                raw = re.sub(r"\s*```$", "", raw)
-            try:
-                data = json.loads(raw)
-            except Exception:
-                # If JSON was truncated or cut off, attempt to salvage tool name so cut-off logic can handle it
-                fn_match = re.search(r'["\']name["\']\s*:\s*["\']([^"\']+)["\']', raw)
-                if fn_match:
-                    calls.append({
-                        "id": f"call_{secrets.token_hex(4)}",
-                        "type": "function",
-                        "function": {"name": fn_match.group(1), "arguments": raw}
-                    })
-                continue
-            if isinstance(data, dict) and "name" in data:
-                fn_name = data["name"]
-                args = data.get("arguments", {})
-                if not isinstance(args, str):
-                    args = json.dumps(args)
-                calls.append({
-                    "id": f"call_{secrets.token_hex(4)}",
-                    "type": "function",
-                    "function": {"name": fn_name, "arguments": args}
-                })
+            data = json.loads(raw)
         except Exception:
             continue
+
+        if not isinstance(data, dict):
+            continue
+        fn_name = data.get("name")
+        if not isinstance(fn_name, str) or fn_name not in ALLOWED_TOOL_NAMES:
+            continue
+        args = data.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                parsed_args = json.loads(args)
+                if not isinstance(parsed_args, dict):
+                    continue
+                args_str = args
+            except Exception:
+                continue
+        elif isinstance(args, dict):
+            args_str = json.dumps(args)
+        else:
+            continue
+
+        calls.append({
+            "id": f"call_text_{secrets.token_hex(4)}",
+            "type": "function",
+            "function": {"name": fn_name, "arguments": args_str}
+        })
     return calls
 
 
@@ -1298,7 +1528,7 @@ def prune_tool_outputs_if_needed(messages):
                 m["content"] = preview + "\n[... output shortened to save context ...]"
 
 
-def run_agent(prompt, auto_approve=False, max_turns=12):
+def run_agent(prompt, auto_approve=False, max_turns=None, max_continues=MAX_CONTINUES):
     """Autonomous agent loop supporting tool calling, file reading, editing, and commands."""
     maybe_compact(extra_chars=len(prompt))
     ws_tree = get_workspace_summary()
@@ -1329,119 +1559,194 @@ def run_agent(prompt, auto_approve=False, max_turns=12):
     ]
 
     turns = 0
-    final_text = ""
-    t0, failed = time.time(), False
+    t0 = time.time()
     STATE.update(thought="", tok_in=0, tok_out=0)
     use_tools = None if is_pure_greeting(prompt) else TOOLS
-    tool_calls = []
-    while turns < max_turns:
-        turns += 1
-        prune_tool_outputs_if_needed(messages)
-        step_lbl = f"Thinking · step {turns}…" if turns > 1 else "Thinking…"
-        res = stream_chat(messages, temp=0.2, max_tokens=DEFAULT_MAX_TOKENS, tools=use_tools, status_label=step_lbl)
-        text, finish, tool_calls = res[0], res[1], res[2] if len(res) > 2 else []
-        failed = text is None                   # the error is already printed
-        use_tools = TOOLS
 
-        if not tool_calls:
-            tool_calls = extract_text_tool_calls(text or "") or extract_text_tool_calls(STATE.get("thought", ""))
-            if not tool_calls and "<tool_call>" in (text or ""):
-                tool_calls = [{
-                    "id": f"call_cut_{secrets.token_hex(4)}",
-                    "type": "function",
-                    "function": {"name": "tool", "arguments": text or ""}
-                }]
-            if tool_calls and "<tool_call>" in (text or ""):
-                text = re.sub(r"<tool_call>.*?(?:</tool_call>|$)", "", text, flags=re.DOTALL).strip()
+    executed_actions = []
+    intermediate_commentary = []
+    final_text = ""
+    task_completed = False
+    stopped_reason = ""
+    failed = False
 
-        if text:
-            final_text += text
+    try:
+        while max_turns is None or turns < max_turns:
+            turns += 1
+            prune_tool_outputs_if_needed(messages)
+            step_lbl = f"Thinking · step {turns}…" if turns > 1 else "Thinking…"
 
-        if not tool_calls:
-            # Model finished without calling any tools
-            if finish == "length":
+            res = stream_chat(messages, temp=0.2, max_tokens=DEFAULT_MAX_TOKENS, tools=use_tools, status_label=step_lbl)
+            turn_text = res[0] if res else None
+            turn_finish = res[1] if res and len(res) > 1 else None
+            turn_tool_calls = res[2] if res and len(res) > 2 else []
+            use_tools = TOOLS
+
+            if turn_text is None and turn_finish == "error":
+                failed = True
+                stopped_reason = "Connection or server error"
+                break
+
+            if turn_finish == "interrupted":
+                stopped_reason = "Generation stream interrupted"
+                failed = True
+                break
+
+            # Handle continuation for responses cut off by length limit
+            if not turn_tool_calls and turn_finish == "length":
                 rounds = 0
-                while finish == "length" and rounds < MAX_CONTINUES:
+                while turn_finish == "length" and rounds < max_continues:
                     rounds += 1
-                    cont_lbl = f"{step_lbl} (continuing {rounds}/{MAX_CONTINUES})"
-                    print(dim(f"[reached the {DEFAULT_MAX_TOKENS}-token limit; asking the model to continue ({rounds}/{MAX_CONTINUES})]"))
+                    cont_lbl = f"{step_lbl} (continuing {rounds}/{max_continues})"
+                    print(dim(f"[reached the {DEFAULT_MAX_TOKENS}-token limit; asking the model to continue ({rounds}/{max_continues})]"))
+                    cont_messages = messages + [
+                        {"role": "assistant", "content": turn_text or ""},
+                        {"role": "user", "content": CONTINUE_PROMPT}
+                    ]
                     more_res = stream_chat(
-                        messages + [{"role": "assistant", "content": final_text or text or ""},
-                                    {"role": "user", "content": CONTINUE_PROMPT}],
-                        temp=0.2, max_tokens=DEFAULT_MAX_TOKENS, tools=None, status_label=cont_lbl
+                        cont_messages,
+                        temp=0.2,
+                        max_tokens=DEFAULT_MAX_TOKENS,
+                        tools=use_tools,
+                        status_label=cont_lbl
                     )
-                    more_text = more_res[0] if more_res else None
-                    finish = more_res[1] if more_res and len(more_res) > 1 else "stop"
-                    if more_text is None:
+                    if not more_res or more_res[0] is None:
                         break
-                    final_text = merge_continuation(final_text, more_text)
-            break
+                    more_text = more_res[0] or ""
+                    turn_finish = more_res[1]
+                    more_tcs = more_res[2] if len(more_res) > 2 else []
 
-        # Record assistant tool call turn
-        messages.append({
-            "role": "assistant",
-            "content": text or "",
-            "tool_calls": tool_calls
-        })
+                    turn_text = merge_continuation(turn_text or "", more_text)
+                    if more_tcs:
+                        turn_tool_calls.extend(more_tcs)
+                        break
 
-        is_cut_off = (finish == "length")
-        for tc in tool_calls:
-            fn = tc.get("function", {})
-            fn_name = fn.get("name", "")
-            raw_args = fn.get("arguments", "{}")
-            call_id = tc.get("id") or f"call_{secrets.token_hex(4)}"
+            # Check for explicit textual tool calls in the response content (never from thought)
+            if not turn_tool_calls:
+                text_tool_calls = extract_text_tool_calls(turn_text or "")
+                if text_tool_calls:
+                    turn_tool_calls = text_tool_calls
+                    turn_text = re.sub(r"<tool_call>.*?</tool_call>", "", turn_text or "", flags=re.DOTALL).strip()
+                elif "<tool_call>" in (turn_text or ""):
+                    # Incomplete / cut-off textual tool call that could not be parsed
+                    if turn_finish == "length":
+                        turn_tool_calls = [{
+                            "id": f"call_cut_{secrets.token_hex(4)}",
+                            "type": "function",
+                            "function": {"name": "tool", "arguments": turn_text or ""}
+                        }]
+                        turn_text = re.sub(r"<tool_call>.*?(?:</tool_call>|$)", "", turn_text or "", flags=re.DOTALL).strip()
 
-            parse_error = False
-            args = None
-            if isinstance(raw_args, dict):
-                args = raw_args
-            elif isinstance(raw_args, str):
-                try:
-                    parsed = json.loads(raw_args)
-                    if isinstance(parsed, dict):
-                        args = parsed
-                    else:
-                        parse_error = True
-                except Exception:
-                    parse_error = True
-            else:
-                parse_error = True
+            if not turn_tool_calls:
+                # Model finished without calling any tools - this is the final response
+                task_completed = True
+                final_text = (turn_text or "").strip()
+                break
 
-            if is_cut_off or parse_error or args is None:
-                verb = fn_name or "Tool"
-                print(yellow("● ") + bold(verb) + " " + red("[cut off - not executed]"))
-                result = "Error: that was cut off, write the file in smaller parts"
-            else:
-                verb, key = TOOL_VERBS.get(fn_name, (fn_name, None))
-                arg = str(args.get(key, "")) if key else ", ".join(f"{k}={v!r}" for k, v in args.items())
-                print(yellow("● ") + bold(verb) + " " + dim((arg.splitlines() or [""])[0][:100]))
-                result = execute_tool(fn_name, args, auto_approve=auto_approve)
+            # Normalize tool calls: assign unique, matching IDs and valid types
+            turn_tool_calls = normalize_tool_calls(turn_tool_calls)
 
+            # Record intermediate commentary from this turn
+            if turn_text and turn_text.strip():
+                intermediate_commentary.append(turn_text.strip())
+
+            # Record assistant turn with normalized tool calls
             messages.append({
-                "role": "tool",
-                "tool_call_id": call_id,
-                "content": str(result)
+                "role": "assistant",
+                "content": turn_text or "",
+                "tool_calls": turn_tool_calls
             })
 
-    if turns >= max_turns and tool_calls:
-        print(yellow(f"Reached the {max_turns}-step limit."))
-        if not final_text and not failed:
-            final_text = f"Reached the {max_turns}-step limit."
+            # Check for repeating failed tool loops (same tool call repeating after errors)
+            if len(messages) >= 6:
+                assistant_turns = [m.get("tool_calls") for m in messages if m.get("role") == "assistant" and m.get("tool_calls")]
+                tool_turns = [m for m in messages if m.get("role") == "tool"]
+                if len(assistant_turns) >= 3 and len(tool_turns) >= 2:
+                    sig1 = _turn_signatures(assistant_turns[-1])
+                    sig2 = _turn_signatures(assistant_turns[-2])
+                    sig3 = _turn_signatures(assistant_turns[-3])
+                    if sig1 and sig1 == sig2 == sig3:
+                        recent_errors = any(_is_tool_error(m.get("content", "")) for m in tool_turns[-len(sig1):])
+                        if recent_errors:
+                            print(yellow("Detected repeating tool loop; stopping agent."))
+                            stopped_reason = "Detected repeating tool loop"
+                            break
 
-    if final_text:
-        STATE["history"].append({"role": "user", "content": prompt})
-        STATE["history"].append({"role": "assistant", "content": final_text})
-        trim_history()
-        save_session()
-    elif failed:
-        executed = [tc.get("function", {}).get("name") for m in messages if m.get("role") == "assistant" for tc in m.get("tool_calls", [])]
-        note = f"[Interrupted while working on: {prompt}]"
-        if executed:
-            note += f" (Ran tools: {', '.join(executed)})"
-        STATE["history"].append({"role": "user", "content": prompt})
-        STATE["history"].append({"role": "assistant", "content": note})
-        trim_history()
-        save_session()
+            is_cut_off = (turn_finish == "length")
+            for tc in turn_tool_calls:
+                fn = tc.get("function", {})
+                fn_name = fn.get("name", "")
+                raw_args = fn.get("arguments", "{}")
+                call_id = tc["id"]
+
+                parse_error = False
+                args = None
+                if isinstance(raw_args, dict):
+                    args = raw_args
+                elif isinstance(raw_args, str):
+                    try:
+                        parsed = json.loads(raw_args)
+                        if isinstance(parsed, dict):
+                            args = parsed
+                        else:
+                            parse_error = True
+                    except Exception:
+                        parse_error = True
+                else:
+                    parse_error = True
+
+                if is_cut_off or parse_error or args is None:
+                    verb = fn_name or "Tool"
+                    print(yellow("● ") + bold(verb) + " " + red("[cut off - not executed]"))
+                    result = "Error: that was cut off, write the file in smaller parts"
+                else:
+                    verb, key = TOOL_VERBS.get(fn_name, (fn_name, None))
+                    arg = str(args.get(key, "")) if key else ", ".join(f"{k}={v!r}" for k, v in args.items())
+                    print(yellow("● ") + bold(verb) + " " + dim((arg.splitlines() or [""])[0][:100]))
+                    try:
+                        result = execute_tool(fn_name, args, auto_approve=auto_approve)
+                    except Exception as err:
+                        result = f"Error: unexpected exception executing tool '{fn_name}': {type(err).__name__}: {err}"
+                    summary_arg = str(args.get(key, "")) if key else ""
+                    executed_actions.append(f"{fn_name}({summary_arg})" if summary_arg else fn_name)
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": str(result)
+                })
+
+    except KeyboardInterrupt:
+        print(dim("\n[Agent interrupted by user]"))
+        stopped_reason = "Interrupted by user"
+        failed = True
+
+    # Assemble final output and update history accurately
+    if not task_completed:
+        actions_str = ", ".join(executed_actions) if executed_actions else "none"
+        if max_turns is not None and turns >= max_turns:
+            print(yellow(f"Reached the {max_turns}-step limit."))
+            final_text = f"Stopped: reached the {max_turns}-step limit before completing the task. Executed actions: {actions_str}."
+            if intermediate_commentary:
+                final_text += f"\nLast planned action: {intermediate_commentary[-1]}"
+        elif stopped_reason:
+            final_text = f"Stopped: {stopped_reason}. Executed actions: {actions_str}."
+        elif failed:
+            final_text = f"[Interrupted while working on: {prompt}]"
+            if executed_actions:
+                final_text += f" (Ran tools: {actions_str})"
+        else:
+            final_text = f"Stopped before completing task. Executed actions: {actions_str}."
+
+    if not final_text and task_completed:
+        actions_str = ", ".join(executed_actions) if executed_actions else "none"
+        final_text = f"Task completed. Executed actions: {actions_str}."
+
+    STATE["history"].append({"role": "user", "content": prompt})
+    STATE["history"].append({"role": "assistant", "content": final_text})
+    trim_history()
+    save_session()
+
     if not failed:
         print_footer(t0, mode_label())
     return final_text
@@ -1856,8 +2161,11 @@ def handle(line, raise_errors=False):
 
 
 def parse_args_chat(line):
-    toks = split_line(line)
-    files, text_toks = [], []
+    try:
+        toks = split_line(line)
+    except UserError:
+        toks = line.split()
+    files = []
     for t in toks:
         if t.startswith("@") and len(t) > 1:
             candidate = t[1:]
@@ -1865,11 +2173,10 @@ def parse_args_chat(line):
             # Treat as file only if it actually exists as a file/dir on disk or explicitly contains a path separator
             if cand_path.is_file() or "/" in candidate or "\\" in candidate:
                 files.append(candidate)
-                text_toks.append(candidate)
-                continue
-        text_toks.append(t)
-    text = " ".join(text_toks)
-    return {"text": text, "files": files, "temp": 0.2, "max_tokens": DEFAULT_MAX_TOKENS}
+    text = line
+    for f in files:
+        text = re.sub(r'(?<!\w)@' + re.escape(f) + r'(?!\w)', f, text)
+    return {"text": text.strip(), "files": files, "temp": 0.2, "max_tokens": DEFAULT_MAX_TOKENS}
 
 
 # ----------------------------------------------------------------------------- the / menu
